@@ -13,7 +13,9 @@ timelapse-style exports.
 - Strip audio checkbox, enabled by default.
 - Target length mode disables the multiplier and calculates the speed from each
   source duration.
-- Output formats: MP4 (H.264) or WebM (VP9).
+- Output formats: MP4 (H.264), WebM (VP9), or GIF for GitHub.
+- GitHub GIF exports use 15 fps, loop forever, scale down to 960px wide when
+  needed, and do not include audio.
 - Output folder field with same-folder output as the default.
 - Per-file queue status, progress, output path, and open-output-folder button.
 - Existing exports are numbered automatically unless Replace existing exports is enabled.

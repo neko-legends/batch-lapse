@@ -397,10 +397,10 @@ fn target_label(seconds: f64) -> String {
 }
 
 fn output_extension(options: &SpeedOptions) -> &'static str {
-    if options.output_format.eq_ignore_ascii_case("webm-vp9") {
-        "webm"
-    } else {
-        "mp4"
+    match options.output_format.as_str() {
+        "webm-vp9" => "webm",
+        "github-gif" => "gif",
+        _ => "mp4",
     }
 }
 
@@ -465,20 +465,30 @@ fn run_ffmpeg_export(
     let output_duration = duration / speed;
     let mut command = Command::new(ffmpeg);
     configure_worker_command(&mut command);
-    command
-        .args(["-hide_banner", "-nostdin", "-y", "-i"])
-        .arg(input)
-        .args(["-map", "0:v:0", "-filter:v"])
-        .arg(format!("setpts=PTS/{speed:.8}"));
-
+    command.args(["-hide_banner", "-nostdin", "-y", "-i"]).arg(input);
+    let github_gif = output_format.eq_ignore_ascii_case("github-gif");
     let webm_vp9 = output_format.eq_ignore_ascii_case("webm-vp9");
-    if webm_vp9 {
+
+    if github_gif {
+        command.args(["-filter_complex"]).arg(format!(
+            "[0:v:0]setpts=PTS/{speed:.8},fps=15,scale=w='min(960\\,iw)':h=-2:flags=lanczos,split[p0][p1];[p0]palettegen=stats_mode=diff[p];[p1][p]paletteuse=dither=bayer:bayer_scale=5"
+        ));
+        command.args(["-loop", "0"]);
+    } else {
+        command
+            .args(["-map", "0:v:0", "-filter:v"])
+            .arg(format!("setpts=PTS/{speed:.8}"));
+    }
+
+    if github_gif {
+        // The palette filter produces an indexed GIF; no video encoder is needed.
+    } else if webm_vp9 {
         command.args(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"]);
     } else {
         command.args(["-c:v", "libx264", "-preset", "medium", "-crf", "20"]);
     }
 
-    if strip_audio {
+    if github_gif || strip_audio {
         command.arg("-an");
     } else {
         let audio_filter = atempo_chain(speed);
@@ -491,7 +501,7 @@ fn run_ffmpeg_export(
         }
     }
 
-    if !webm_vp9 {
+    if !webm_vp9 && !github_gif {
         command.args(["-movflags", "+faststart"]);
     }
     command
@@ -659,7 +669,7 @@ fn start_speed_job(
     if !options.use_target_length && !(1.0..=10.0).contains(&options.multiplier) {
         return Err("Multiplier must be between 1x and 10x.".to_string());
     }
-    if !["mp4-h264", "webm-vp9"].contains(&options.output_format.as_str()) {
+    if !["mp4-h264", "webm-vp9", "github-gif"].contains(&options.output_format.as_str()) {
         return Err("Unsupported output format.".to_string());
     }
 

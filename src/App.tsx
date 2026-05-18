@@ -21,7 +21,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type QueueStatus = "pending" | "running" | "done" | "error" | "canceled";
-type OutputFormat = "mp4-h264" | "webm-vp9";
+type OutputFormat = "mp4-h264" | "webm-vp9" | "github-gif";
 
 type RuntimeStatus = {
   ffmpegFound: boolean;
@@ -79,7 +79,7 @@ type WorkerEvent = {
 
 const SETTINGS_STORAGE_KEY = "batchlapse.settings.v1";
 const VIDEO_EXTENSIONS = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts", "m2ts"];
-const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["mp4-h264", "webm-vp9"];
+const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["mp4-h264", "webm-vp9", "github-gif"];
 
 const defaultOptions: SpeedOptions = {
   multiplier: 2,
@@ -581,6 +581,7 @@ function App() {
               >
                 <option value="mp4-h264">MP4 (H.264)</option>
                 <option value="webm-vp9">WebM (VP9)</option>
+                <option value="github-gif">GIF (GitHub, no audio)</option>
               </select>
             </label>
 
