@@ -51,6 +51,9 @@ To download FFmpeg into this project, run this from the BatchLapse folder:
 powershell -ExecutionPolicy Bypass -File .\scripts\download-ffmpeg.ps1
 ```
 
+Or download FFmpeg manually from:
+[gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/)
+
 Yes, that command downloads FFmpeg. It downloads the Windows essentials build
 from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), which is linked from the
 official [FFmpeg download page](https://www.ffmpeg.org/download.html), and copies
