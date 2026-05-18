@@ -16,6 +16,8 @@ timelapse-style exports.
 - Output formats: MP4 (H.264), WebM (VP9), or GIF for GitHub.
 - GitHub GIF exports use 15 fps, loop forever, scale down to 960px wide when
   needed, and do not include audio.
+- GitHub limits GIF uploads in issues and pull requests to 10 MB. BatchLapse
+  includes a 1-9 MB GIF size target so exports leave room under that limit.
 - Output folder field with same-folder output as the default.
 - Per-file queue status, progress, output path, and open-output-folder button.
 - Existing exports are numbered automatically unless Replace existing exports is enabled.

@@ -17,8 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::os::windows::process::CommandExt;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts",
-    "m2ts",
+    "mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts", "m2ts",
 ];
 
 #[cfg(target_os = "windows")]
@@ -52,6 +51,7 @@ struct SpeedOptions {
     strip_audio: bool,
     replace_existing: bool,
     output_format: String,
+    github_gif_max_mb: f64,
     output_dir: String,
     ffmpeg_dir: String,
 }
@@ -227,7 +227,9 @@ fn local_binary_candidates(app: &AppHandle, name: &str, ffmpeg_dir: &str) -> Vec
         Some(current_dir.join(&exe_name)),
         exe_dir.as_ref().map(|dir| dir.join("bin").join(&exe_name)),
         exe_dir.as_ref().map(|dir| dir.join(&exe_name)),
-        resource_dir.as_ref().map(|dir| dir.join("bin").join(&exe_name)),
+        resource_dir
+            .as_ref()
+            .map(|dir| dir.join("bin").join(&exe_name)),
         resource_dir.as_ref().map(|dir| dir.join(&exe_name)),
     ]
     .into_iter()
@@ -450,66 +452,21 @@ fn parse_progress_line(line: &str, output_duration: f64) -> Option<f64> {
     Some((micros / 1_000_000.0 / output_duration * 100.0).clamp(0.0, 100.0))
 }
 
-fn run_ffmpeg_export(
+fn github_gif_filter(speed: f64, width: u32, fps: u32) -> String {
+    format!(
+        "[0:v:0]setpts=PTS/{speed:.8},fps={fps},scale=w='min({width}\\,iw)':h=-2:flags=lanczos,split[p0][p1];[p0]palettegen=stats_mode=diff[p];[p1][p]paletteuse=dither=bayer:bayer_scale=5"
+    )
+}
+
+fn run_ffmpeg_command(
     app: &AppHandle,
     active_jobs: &ActiveJobState,
     job_id: &str,
-    ffmpeg: &Path,
+    mut command: Command,
     input: &Path,
     output: &Path,
-    speed: f64,
-    duration: f64,
-    strip_audio: bool,
-    output_format: &str,
+    output_duration: f64,
 ) -> Result<(), String> {
-    let output_duration = duration / speed;
-    let mut command = Command::new(ffmpeg);
-    configure_worker_command(&mut command);
-    command.args(["-hide_banner", "-nostdin", "-y", "-i"]).arg(input);
-    let github_gif = output_format.eq_ignore_ascii_case("github-gif");
-    let webm_vp9 = output_format.eq_ignore_ascii_case("webm-vp9");
-
-    if github_gif {
-        command.args(["-filter_complex"]).arg(format!(
-            "[0:v:0]setpts=PTS/{speed:.8},fps=15,scale=w='min(960\\,iw)':h=-2:flags=lanczos,split[p0][p1];[p0]palettegen=stats_mode=diff[p];[p1][p]paletteuse=dither=bayer:bayer_scale=5"
-        ));
-        command.args(["-loop", "0"]);
-    } else {
-        command
-            .args(["-map", "0:v:0", "-filter:v"])
-            .arg(format!("setpts=PTS/{speed:.8}"));
-    }
-
-    if github_gif {
-        // The palette filter produces an indexed GIF; no video encoder is needed.
-    } else if webm_vp9 {
-        command.args(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"]);
-    } else {
-        command.args(["-c:v", "libx264", "-preset", "medium", "-crf", "20"]);
-    }
-
-    if github_gif || strip_audio {
-        command.arg("-an");
-    } else {
-        let audio_filter = atempo_chain(speed);
-        command.args(["-map", "0:a?", "-filter:a"]);
-        command.arg(audio_filter);
-        if webm_vp9 {
-            command.args(["-c:a", "libopus", "-b:a", "128k"]);
-        } else {
-            command.args(["-c:a", "aac", "-b:a", "192k"]);
-        }
-    }
-
-    if !webm_vp9 && !github_gif {
-        command.args(["-movflags", "+faststart"]);
-    }
-    command
-        .args(["-progress", "pipe:1", "-nostats"])
-        .arg(output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
     let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to start ffmpeg: {error}"))?;
@@ -568,6 +525,135 @@ fn run_ffmpeg_export(
         return Err("ffmpeg exited with an error.".to_string());
     }
     Ok(())
+}
+
+fn run_ffmpeg_export(
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    job_id: &str,
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    speed: f64,
+    duration: f64,
+    strip_audio: bool,
+    output_format: &str,
+    github_gif_max_mb: f64,
+) -> Result<(), String> {
+    let output_duration = duration / speed;
+    let github_gif = output_format.eq_ignore_ascii_case("github-gif");
+    let webm_vp9 = output_format.eq_ignore_ascii_case("webm-vp9");
+
+    if github_gif {
+        let target_mb = github_gif_max_mb.clamp(1.0, 9.0);
+        let target_bytes = (target_mb * 1024.0 * 1024.0) as u64;
+        let variants = [
+            (960, 15),
+            (800, 15),
+            (800, 12),
+            (640, 12),
+            (640, 10),
+            (480, 10),
+            (480, 8),
+            (360, 8),
+            (320, 6),
+        ];
+        let mut last_size = 0;
+
+        for (index, (width, fps)) in variants.iter().enumerate() {
+            if index > 0 {
+                let _ = app.emit(
+                    "video-worker-event",
+                    serde_json::json!({
+                        "type": "log",
+                        "path": input.display().to_string(),
+                        "message": format!("GIF was {:.1} MB. Retrying at {}px / {} fps for the {:.0} MB target.", last_size as f64 / 1_048_576.0, width, fps, target_mb)
+                    }),
+                );
+            }
+
+            let mut command = Command::new(ffmpeg);
+            configure_worker_command(&mut command);
+            command
+                .args(["-hide_banner", "-nostdin", "-y", "-i"])
+                .arg(input)
+                .args(["-filter_complex"])
+                .arg(github_gif_filter(speed, *width, *fps))
+                .args(["-loop", "0", "-an", "-progress", "pipe:1", "-nostats"])
+                .arg(output)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            run_ffmpeg_command(
+                app,
+                active_jobs,
+                job_id,
+                command,
+                input,
+                output,
+                output_duration,
+            )?;
+            last_size = fs::metadata(output)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if last_size <= target_bytes {
+                return Ok(());
+            }
+        }
+
+        let _ = fs::remove_file(output);
+        return Err(format!(
+            "GIF is {:.1} MB after reducing quality, above the {:.0} MB target. Try a shorter target length or a higher size target.",
+            last_size as f64 / 1_048_576.0,
+            target_mb
+        ));
+    }
+
+    let mut command = Command::new(ffmpeg);
+    configure_worker_command(&mut command);
+    command
+        .args(["-hide_banner", "-nostdin", "-y", "-i"])
+        .arg(input)
+        .args(["-map", "0:v:0", "-filter:v"])
+        .arg(format!("setpts=PTS/{speed:.8}"));
+
+    if webm_vp9 {
+        command.args(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"]);
+    } else {
+        command.args(["-c:v", "libx264", "-preset", "medium", "-crf", "20"]);
+    }
+
+    if strip_audio {
+        command.arg("-an");
+    } else {
+        let audio_filter = atempo_chain(speed);
+        command.args(["-map", "0:a?", "-filter:a"]);
+        command.arg(audio_filter);
+        if webm_vp9 {
+            command.args(["-c:a", "libopus", "-b:a", "128k"]);
+        } else {
+            command.args(["-c:a", "aac", "-b:a", "192k"]);
+        }
+    }
+
+    if !webm_vp9 {
+        command.args(["-movflags", "+faststart"]);
+    }
+    command
+        .args(["-progress", "pipe:1", "-nostats"])
+        .arg(output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    run_ffmpeg_command(
+        app,
+        active_jobs,
+        job_id,
+        command,
+        input,
+        output,
+        output_duration,
+    )
 }
 
 fn missing_binary_message(binary: &str, ffmpeg_dir: &str) -> String {
@@ -672,6 +758,12 @@ fn start_speed_job(
     if !["mp4-h264", "webm-vp9", "github-gif"].contains(&options.output_format.as_str()) {
         return Err("Unsupported output format.".to_string());
     }
+    if options.output_format == "github-gif"
+        && (!options.github_gif_max_mb.is_finite()
+            || !(1.0..=9.0).contains(&options.github_gif_max_mb))
+    {
+        return Err("GitHub GIF size target must be between 1 MB and 9 MB.".to_string());
+    }
 
     let ffmpeg = find_binary(&app, "ffmpeg", &options.ffmpeg_dir)
         .ok_or_else(|| missing_binary_message("ffmpeg", &options.ffmpeg_dir))?;
@@ -731,6 +823,7 @@ fn start_speed_job(
                     duration,
                     options.strip_audio,
                     &options.output_format,
+                    options.github_gif_max_mb,
                 )?;
                 Ok((output, speed))
             })();

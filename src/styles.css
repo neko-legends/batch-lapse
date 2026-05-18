@@ -159,6 +159,19 @@ small,
   margin-top: 12px;
 }
 
+.format-options {
+  margin: 10px 0 12px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0a0f12;
+}
+
+.format-options small {
+  display: block;
+  margin-top: 6px;
+}
+
 .output-folder-row {
   display: grid;
   grid-template-columns: 1fr 38px 70px;

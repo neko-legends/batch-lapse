@@ -45,6 +45,7 @@ type SpeedOptions = {
   stripAudio: boolean;
   replaceExisting: boolean;
   outputFormat: OutputFormat;
+  githubGifMaxMb: number;
   outputDir: string;
   ffmpegDir: string;
   recursive: boolean;
@@ -88,6 +89,7 @@ const defaultOptions: SpeedOptions = {
   stripAudio: true,
   replaceExisting: false,
   outputFormat: "mp4-h264",
+  githubGifMaxMb: 9,
   outputDir: "",
   ffmpegDir: "",
   recursive: true
@@ -123,6 +125,7 @@ function loadSavedOptions(): SpeedOptions {
       stripAudio: coerceBoolean(parsed.stripAudio, defaultOptions.stripAudio),
       replaceExisting: coerceBoolean(parsed.replaceExisting, defaultOptions.replaceExisting),
       outputFormat: coerceChoice(parsed.outputFormat, OUTPUT_FORMAT_OPTIONS, defaultOptions.outputFormat),
+      githubGifMaxMb: coerceNumber(parsed.githubGifMaxMb, defaultOptions.githubGifMaxMb, 1, 9),
       outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : "",
       ffmpegDir: typeof parsed.ffmpegDir === "string" ? parsed.ffmpegDir : defaultOptions.ffmpegDir,
       recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive)
@@ -477,6 +480,7 @@ function App() {
           stripAudio: options.stripAudio,
           replaceExisting: options.replaceExisting,
           outputFormat: options.outputFormat,
+          githubGifMaxMb: options.githubGifMaxMb,
           outputDir: options.outputDir,
           ffmpegDir: options.ffmpegDir
         }
@@ -584,6 +588,28 @@ function App() {
                 <option value="github-gif">GIF (GitHub, no audio)</option>
               </select>
             </label>
+
+            {options.outputFormat === "github-gif" ? (
+              <div className="format-options">
+                <div className="range-field">
+                  <div className="range-labels">
+                    <span>GitHub GIF size target</span>
+                    <strong>{options.githubGifMaxMb.toFixed(0)} MB</strong>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="9"
+                    step="1"
+                    value={options.githubGifMaxMb}
+                    onChange={(event) =>
+                      setOptions((current) => ({ ...current, githubGifMaxMb: Number(event.target.value) }))
+                    }
+                  />
+                </div>
+                <small>GitHub GIF uploads are limited to 10 MB. BatchLapse leaves a margin and may reduce GIF size or frame rate to fit.</small>
+              </div>
+            ) : null}
 
             <label className="toggle">
               <input
