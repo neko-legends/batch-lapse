@@ -1,12 +1,11 @@
 # BatchLapse
 
 BatchLapse is a local Windows desktop batch tool for turning videos into
-timelapse-style exports with FFmpeg. It uses the same Tauri + React shell style
-as DepthMap AI Generator.
+timelapse-style exports.
 
 ![BatchLapse screenshot](sc.webp)
 
-## Features
+## What It Does
 
 - Drag and drop one video, many videos, or folders.
 - Batch select videos or a folder from buttons in the toolbar.
@@ -21,16 +20,24 @@ as DepthMap AI Generator.
 
 ## FFmpeg
 
-The app needs `ffmpeg.exe` and `ffprobe.exe`. It checks the selected FFmpeg
-folder first, then portable app folders, then `D:\Tools\ffmpeg\bin`, then PATH.
-Use the folder button in the Runtime panel to browse to the FFmpeg folder.
+BatchLapse requires FFmpeg. Specifically, it needs both `ffmpeg.exe` and
+`ffprobe.exe`.
 
-For a portable folder, put both files in `bin\` or next to the app executable.
-During development, either add FFmpeg to PATH or run:
+The portable build includes these files when they are available in the project
+`bin` folder or in `D:\Tools\ffmpeg\bin`. If BatchLapse cannot find them, use
+the folder button in the Runtime panel and choose the folder that contains both
+files.
+
+To download FFmpeg into this project, run this from the BatchLapse folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\download-ffmpeg.ps1
 ```
+
+Yes, that command downloads FFmpeg. It downloads the Windows essentials build
+from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), which is linked from the
+official [FFmpeg download page](https://www.ffmpeg.org/download.html), and copies
+`ffmpeg.exe` and `ffprobe.exe` into `bin\`.
 
 ## Development
 
