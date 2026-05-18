@@ -1,7 +1,7 @@
 # BatchLapse
 
-BatchLapse is a local Windows desktop batch tool for turning videos into
-timelapse-style exports.
+BatchLapse is a local desktop batch tool for turning videos into timelapse-style
+exports.
 
 ![BatchLapse screenshot](sc.webp)
 
@@ -37,15 +37,18 @@ This is a 15-second GitHub GIF export from BatchLapse:
 
 ## FFmpeg
 
-BatchLapse requires FFmpeg. Specifically, it needs both `ffmpeg.exe` and
+BatchLapse requires FFmpeg. Specifically, it needs both `ffmpeg` and `ffprobe`
+available on the machine. On Windows these files are named `ffmpeg.exe` and
 `ffprobe.exe`.
 
-The portable build includes these files when they are available in the project
-`bin` folder or in `D:\Tools\ffmpeg\bin`. If BatchLapse cannot find them, use
-the folder button in the Runtime panel and choose the folder that contains both
-files.
+On Windows, the portable build includes these files when they are available in
+the project `bin` folder or in `D:\Tools\ffmpeg\bin`. On macOS and Linux, install
+FFmpeg with your system package manager or place the binaries in the app `bin`
+folder. If BatchLapse cannot find FFmpeg, use the folder button in the Runtime
+panel and choose the folder that contains both files.
 
-To download FFmpeg into this project, run this from the BatchLapse folder:
+To download FFmpeg into this project on Windows, run this from the BatchLapse
+folder:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\download-ffmpeg.ps1
@@ -54,20 +57,61 @@ powershell -ExecutionPolicy Bypass -File .\scripts\download-ffmpeg.ps1
 Or download FFmpeg manually from:
 [gyan.dev FFmpeg builds](https://www.gyan.dev/ffmpeg/builds/)
 
-Yes, that command downloads FFmpeg. It downloads the Windows essentials build
-from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), which is linked from the
-official [FFmpeg download page](https://www.ffmpeg.org/download.html), and copies
-`ffmpeg.exe` and `ffprobe.exe` into `bin\`.
+Yes, that PowerShell command downloads FFmpeg. It downloads the Windows
+essentials build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), which is
+linked from the official [FFmpeg download page](https://www.ffmpeg.org/download.html),
+and copies `ffmpeg.exe` and `ffprobe.exe` into `bin\`.
+
+Common macOS and Linux install commands:
+
+```bash
+# macOS with Homebrew
+brew install ffmpeg
+
+# Ubuntu or Debian
+sudo apt update
+sudo apt install -y ffmpeg
+
+# Fedora
+sudo dnf install ffmpeg
+
+# Arch
+sudo pacman -S ffmpeg
+```
+
+## Platform Support
+
+The published release assets are currently Windows builds. The app code is set
+up to run from source on Windows, macOS, and Linux as long as the Tauri desktop
+prerequisites and FFmpeg are installed.
+
+Use the official Tauri prerequisites page for current OS-specific system
+packages:
+[Tauri v2 prerequisites](https://v2.tauri.app/start/prerequisites/)
+
+## AI Agent Setup
+
+Use this checklist when asking an AI coding agent to set up BatchLapse on a fresh
+machine:
+
+1. Install Node.js 20 or newer.
+2. Install Rust stable with `rustup`.
+3. Install the Tauri v2 prerequisites for the target OS.
+4. Install FFmpeg and verify `ffmpeg -version` and `ffprobe -version` work.
+5. Run `npm install`.
+6. Run `npm run build`.
+7. Run `npm run tauri:dev` for development.
+8. Run `npm run tauri:build` to create platform-native Tauri bundles.
 
 ## Development
 
-```powershell
+```bash
 npm install
 npm run build
 npm run tauri:dev
 ```
 
-## Portable Build
+## Windows Portable Build
 
 ```powershell
 npm run tauri:build

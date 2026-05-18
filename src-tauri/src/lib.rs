@@ -203,11 +203,11 @@ fn executable_name(name: &str) -> String {
     }
 }
 
-fn default_ffmpeg_dir() -> PathBuf {
+fn default_ffmpeg_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
-        PathBuf::from(r"D:\Tools\ffmpeg\bin")
+        Some(PathBuf::from(r"D:\Tools\ffmpeg\bin"))
     } else {
-        PathBuf::new()
+        None
     }
 }
 
@@ -222,7 +222,7 @@ fn local_binary_candidates(app: &AppHandle, name: &str, ffmpeg_dir: &str) -> Vec
 
     [
         (!selected_dir.is_empty()).then(|| PathBuf::from(selected_dir).join(&exe_name)),
-        Some(default_ffmpeg_dir().join(&exe_name)),
+        default_ffmpeg_dir().map(|dir| dir.join(&exe_name)),
         Some(current_dir.join("bin").join(&exe_name)),
         Some(current_dir.join(&exe_name)),
         exe_dir.as_ref().map(|dir| dir.join("bin").join(&exe_name)),
@@ -623,13 +623,22 @@ fn run_ffmpeg_export(
 
 fn missing_binary_message(binary: &str, ffmpeg_dir: &str) -> String {
     let selected = ffmpeg_dir.trim();
+    let binary_name = executable_name(binary);
     if selected.is_empty() {
-        format!(
-            "{binary}.exe was not found. Choose its folder, use D:\\Tools\\ffmpeg\\bin, add it to PATH, or place it in this app's bin folder."
-        )
+        if cfg!(target_os = "windows") {
+            format!(
+                "{binary_name} was not found. Choose its folder, use D:\\Tools\\ffmpeg\\bin, add it to PATH, or place it in this app's bin folder."
+            )
+        } else {
+            format!(
+                "{binary_name} was not found. Choose its folder, add it to PATH, or place it in this app's bin folder."
+            )
+        }
     } else {
         format!(
-            "{binary}.exe was not found in {selected}. Choose the folder containing ffmpeg.exe and ffprobe.exe."
+            "{binary_name} was not found in {selected}. Choose the folder containing {} and {}.",
+            executable_name("ffmpeg"),
+            executable_name("ffprobe")
         )
     }
 }

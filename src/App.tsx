@@ -459,7 +459,7 @@ function App() {
 
   const start = async () => {
     if (!runtime?.ffmpegFound || !runtime?.ffprobeFound) {
-      pushLog("ffmpeg.exe and ffprobe.exe are required before export.");
+      pushLog("ffmpeg and ffprobe are required before export.");
       return;
     }
     if (queue.length === 0 || busy) return;
@@ -689,7 +689,7 @@ function App() {
                 </button>
               </div>
             </div>
-            <small>BatchLapse checks this folder, app folders, D:\Tools\ffmpeg\bin, then PATH.</small>
+            <small>BatchLapse checks this folder, app folders, a local bin folder, a common Windows FFmpeg folder, then PATH.</small>
             <button className="secondary folder-button" onClick={() => void refreshRuntime()}>
               <RotateCcw size={16} />
               Refresh runtime
