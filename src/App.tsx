@@ -22,7 +22,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type QueueStatus = "pending" | "running" | "done" | "error" | "canceled";
 type OutputFormat = "mp4-h264" | "webm-vp9" | "github-gif";
-type OutputResolution = 720 | 1080 | 1440;
+type OutputResolution = 480 | 720 | 1080 | 1440;
+type SpeedMode = "multiplier" | "target-length";
 
 type RuntimeStatus = {
   ffmpegFound: boolean;
@@ -43,8 +44,13 @@ type VideoInfo = {
 
 type SpeedOptions = {
   multiplier: number;
-  useTargetLength: boolean;
+  speedMode: SpeedMode;
   targetSeconds: number;
+  useClipLength: boolean;
+  clipSeconds: number;
+  useTargetSize: boolean;
+  targetSizeMb: number;
+  gifFps: number;
   stripAudio: boolean;
   replaceExisting: boolean;
   outputFormat: OutputFormat;
@@ -86,13 +92,22 @@ type WorkerEvent = {
 const SETTINGS_STORAGE_KEY = "batchlapse.settings.v1";
 const VIDEO_EXTENSIONS = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts", "m2ts"];
 const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["mp4-h264", "webm-vp9", "github-gif"];
-const OUTPUT_RESOLUTION_OPTIONS: OutputResolution[] = [720, 1080, 1440];
+const OUTPUT_RESOLUTION_OPTIONS: OutputResolution[] = [480, 720, 1080, 1440];
+const SPEED_MODE_OPTIONS: SpeedMode[] = ["multiplier", "target-length"];
 const GITHUB_GIF_MAX_SECONDS = 30;
+const TARGET_SIZE_MAX_MB = 9.5;
+const GIF_FPS_MIN = 5;
+const GIF_FPS_MAX = 30;
 
 const defaultOptions: SpeedOptions = {
   multiplier: 2,
-  useTargetLength: false,
+  speedMode: "multiplier",
   targetSeconds: 10,
+  useClipLength: false,
+  clipSeconds: 60,
+  useTargetSize: false,
+  targetSizeMb: TARGET_SIZE_MAX_MB,
+  gifFps: 15,
   stripAudio: true,
   replaceExisting: false,
   outputFormat: "mp4-h264",
@@ -129,13 +144,25 @@ function loadSavedOptions(): SpeedOptions {
     const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!saved) return defaultOptions;
     const parsed = JSON.parse(saved) as Partial<SpeedOptions>;
+    const outputFormat = coerceChoice(parsed.outputFormat, OUTPUT_FORMAT_OPTIONS, defaultOptions.outputFormat);
+    const fallbackSpeedMode = (parsed as Partial<SpeedOptions> & { useTargetLength?: boolean }).useTargetLength
+      ? "target-length"
+      : defaultOptions.speedMode;
     return {
       multiplier: coerceNumber(parsed.multiplier, defaultOptions.multiplier, 1, 10),
-      useTargetLength: coerceBoolean(parsed.useTargetLength, defaultOptions.useTargetLength),
+      speedMode: coerceChoice(parsed.speedMode, SPEED_MODE_OPTIONS, fallbackSpeedMode),
       targetSeconds: coerceNumber(parsed.targetSeconds, defaultOptions.targetSeconds, 0.1, 86400),
+      useClipLength: coerceBoolean(parsed.useClipLength, defaultOptions.useClipLength),
+      clipSeconds: coerceNumber(parsed.clipSeconds, defaultOptions.clipSeconds, 0.1, 86400),
+      useTargetSize: coerceBoolean(
+        parsed.useTargetSize,
+        outputFormat === "github-gif" ? true : defaultOptions.useTargetSize
+      ),
+      targetSizeMb: coerceNumber(parsed.targetSizeMb, defaultOptions.targetSizeMb, 0.1, TARGET_SIZE_MAX_MB),
+      gifFps: coerceNumber(parsed.gifFps, defaultOptions.gifFps, GIF_FPS_MIN, GIF_FPS_MAX),
       stripAudio: coerceBoolean(parsed.stripAudio, defaultOptions.stripAudio),
       replaceExisting: coerceBoolean(parsed.replaceExisting, defaultOptions.replaceExisting),
-      outputFormat: coerceChoice(parsed.outputFormat, OUTPUT_FORMAT_OPTIONS, defaultOptions.outputFormat),
+      outputFormat,
       outputResolution: coerceResolution(parsed.outputResolution, defaultOptions.outputResolution),
       outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : "",
       ffmpegDir: typeof parsed.ffmpegDir === "string" ? parsed.ffmpegDir : defaultOptions.ffmpegDir,
@@ -493,8 +520,13 @@ function App() {
         paths: queue.map((item) => item.path),
         options: {
           multiplier: options.multiplier,
-          useTargetLength: options.useTargetLength,
+          useTargetLength: options.speedMode === "target-length",
           targetSeconds: options.targetSeconds,
+          useClipLength: options.useClipLength,
+          clipSeconds: options.clipSeconds,
+          useTargetSize: options.useTargetSize,
+          targetSizeMb: options.targetSizeMb,
+          gifFps: options.gifFps,
           stripAudio: options.stripAudio,
           replaceExisting: options.replaceExisting,
           outputFormat: options.outputFormat,
@@ -530,10 +562,22 @@ function App() {
   };
 
   const projectedSpeed = (item: QueueItem) => {
-    if (!options.useTargetLength) return `${options.multiplier.toFixed(1)}x`;
-    if (!item.durationSeconds) return "--";
-    return `${(item.durationSeconds / options.targetSeconds).toFixed(2)}x`;
+    if (options.speedMode !== "target-length") return `${options.multiplier.toFixed(1)}x`;
+    const duration = effectiveSourceSeconds(item.durationSeconds);
+    if (!duration) return "--";
+    return `${(duration / options.targetSeconds).toFixed(2)}x`;
   };
+
+  const effectiveSourceSeconds = (duration?: number | null) => {
+    if (!duration || !Number.isFinite(duration)) return duration;
+    return options.useClipLength ? Math.min(duration, options.clipSeconds) : duration;
+  };
+
+  const exportSummary = options.useClipLength
+    ? `Using first ${options.clipSeconds}s of each source.`
+    : options.speedMode === "target-length"
+      ? `Each video is sped up to target ${options.targetSeconds}s exports.`
+      : `Each video is exported at ${options.multiplier.toFixed(1)}x speed.`;
 
   return (
     <div className="scale-stage">
@@ -555,23 +599,198 @@ function App() {
               Export controls
             </div>
 
-            <div className="range-field">
-              <div className="range-labels">
-                <span>Speed multiplier</span>
-                <strong>{options.multiplier.toFixed(1)}x</strong>
+            <label className="field">
+              <span>Output format</span>
+              <select
+                value={options.outputFormat}
+                onChange={(event) => {
+                  const outputFormat = event.target.value as OutputFormat;
+                  setOptions((current) => ({
+                    ...current,
+                    outputFormat,
+                    useTargetSize: outputFormat === "github-gif" ? true : current.useTargetSize,
+                    targetSeconds: current.targetSeconds
+                  }));
+                }}
+              >
+                <option value="mp4-h264">MP4 (H.264)</option>
+                <option value="webm-vp9">WebM (VP9)</option>
+                <option value="github-gif">GIF (GitHub, no audio)</option>
+              </select>
+            </label>
+
+            {options.outputFormat === "github-gif" ? (
+              <div className="format-options">
+                <small>GitHub GIF uploads are limited to 10 MB. Size target can lower FPS/resolution, but use Source clip when the export is still too long.</small>
               </div>
-              <input
-                type="range"
-                min="1"
-                max="10"
-                step="0.1"
-                disabled={options.useTargetLength}
-                value={options.multiplier}
+            ) : null}
+
+            <label className="field">
+              <span>Output resolution</span>
+              <select
+                value={options.outputResolution}
                 onChange={(event) =>
-                  setOptions((current) => ({ ...current, multiplier: Number(event.target.value) }))
+                  setOptions((current) => ({
+                    ...current,
+                    outputResolution: Number(event.target.value) as OutputResolution
+                  }))
+                }
+              >
+                <option value="480">480p</option>
+                <option value="720">720p</option>
+                <option value="1080">1080p</option>
+                <option value="1440">1440p</option>
+              </select>
+              <small>Preserves aspect ratio and does not upscale smaller videos.</small>
+            </label>
+
+            <label className="field">
+              <span>Timing mode</span>
+              <select
+                value={options.speedMode}
+                onChange={(event) =>
+                  setOptions((current) => ({ ...current, speedMode: event.target.value as SpeedMode }))
+                }
+              >
+                <option value="multiplier">Speed multiplier</option>
+                <option value="target-length">Target output length</option>
+              </select>
+            </label>
+
+            {options.speedMode === "multiplier" ? (
+              <div className="range-field">
+                <div className="range-labels">
+                  <span>Speed multiplier</span>
+                  <strong>{options.multiplier.toFixed(1)}x</strong>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  step="0.1"
+                  value={options.multiplier}
+                  onChange={(event) =>
+                    setOptions((current) => ({ ...current, multiplier: Number(event.target.value) }))
+                  }
+                />
+              </div>
+            ) : (
+              <label className="field target-field">
+                <span>Target output length in seconds</span>
+                <input
+                  type="number"
+                  min="0.1"
+                  max={options.outputFormat === "github-gif" && !options.useTargetSize ? GITHUB_GIF_MAX_SECONDS : undefined}
+                  step="0.1"
+                  value={options.targetSeconds}
+                  onChange={(event) => {
+                    const maxSeconds =
+                      options.outputFormat === "github-gif" && !options.useTargetSize ? GITHUB_GIF_MAX_SECONDS : 86400;
+                    setOptions((current) => ({
+                      ...current,
+                      targetSeconds: Math.min(
+                        maxSeconds,
+                        Math.max(0.1, Number(event.target.value) || current.targetSeconds)
+                      )
+                    }));
+                  }}
+                />
+              </label>
+            )}
+
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={options.useClipLength}
+                onChange={(event) => setOptions((current) => ({ ...current, useClipLength: event.target.checked }))}
+              />
+              <span>Limit source clip</span>
+            </label>
+
+            {options.useClipLength ? (
+              <label className="field target-field">
+                <span>Use first seconds of source</span>
+                <input
+                  type="number"
+                  min="0.1"
+                  max="86400"
+                  step="0.1"
+                  value={options.clipSeconds}
+                  onChange={(event) =>
+                    setOptions((current) => ({
+                      ...current,
+                      clipSeconds: Math.min(86400, Math.max(0.1, Number(event.target.value) || current.clipSeconds))
+                    }))
+                  }
+                />
+              </label>
+            ) : null}
+
+            {options.outputFormat === "github-gif" ? (
+              <label className="field target-field">
+                <span>GIF FPS</span>
+                <input
+                  type="number"
+                  min={GIF_FPS_MIN}
+                  max={GIF_FPS_MAX}
+                  step="1"
+                  value={options.gifFps}
+                  onChange={(event) =>
+                    setOptions((current) => ({
+                      ...current,
+                      gifFps: Math.min(
+                        GIF_FPS_MAX,
+                        Math.max(GIF_FPS_MIN, Math.round(Number(event.target.value) || current.gifFps))
+                      )
+                    }))
+                  }
+                />
+                <small>Size targeting may lower this automatically.</small>
+              </label>
+            ) : null}
+
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={options.useTargetSize}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    useTargetSize: event.target.checked,
+                    targetSeconds:
+                      !event.target.checked && current.outputFormat === "github-gif"
+                        ? Math.min(current.targetSeconds, GITHUB_GIF_MAX_SECONDS)
+                        : current.targetSeconds
+                  }))
                 }
               />
-            </div>
+              <span>Use target file size</span>
+            </label>
+
+            {options.useTargetSize ? (
+              <label className="field target-field">
+                <span>Target size in MB</span>
+                <input
+                  type="number"
+                  min="0.1"
+                  max={TARGET_SIZE_MAX_MB}
+                  step="0.1"
+                  value={options.targetSizeMb}
+                  onChange={(event) =>
+                    setOptions((current) => ({
+                      ...current,
+                      targetSizeMb: Math.min(
+                        TARGET_SIZE_MAX_MB,
+                        Math.max(0.1, Number(event.target.value) || current.targetSizeMb)
+                      )
+                    }))
+                  }
+                />
+                <small>
+                  MP4/WebM use bitrate targeting. GIFs lower FPS/resolution as needed to stay under the target.
+                </small>
+              </label>
+            ) : null}
 
             <label className="toggle">
               <input
@@ -592,86 +811,6 @@ function App() {
               />
               <span>Replace existing exports</span>
             </label>
-
-            <label className="field">
-              <span>Output format</span>
-              <select
-                value={options.outputFormat}
-                onChange={(event) => {
-                  const outputFormat = event.target.value as OutputFormat;
-                  setOptions((current) => ({
-                    ...current,
-                    outputFormat,
-                    targetSeconds:
-                      outputFormat === "github-gif"
-                        ? Math.min(current.targetSeconds, GITHUB_GIF_MAX_SECONDS)
-                        : current.targetSeconds
-                  }));
-                }}
-              >
-                <option value="mp4-h264">MP4 (H.264)</option>
-                <option value="webm-vp9">WebM (VP9)</option>
-                <option value="github-gif">GIF (GitHub, no audio)</option>
-              </select>
-            </label>
-
-            {options.outputFormat === "github-gif" ? (
-              <div className="format-options">
-                <small>GitHub GIF uploads are limited to 10 MB. BatchLapse caps GitHub GIF exports at 30 seconds using 15 fps and the selected output resolution.</small>
-              </div>
-            ) : null}
-
-            <label className="field">
-              <span>Output resolution</span>
-              <select
-                value={options.outputResolution}
-                onChange={(event) =>
-                  setOptions((current) => ({
-                    ...current,
-                    outputResolution: Number(event.target.value) as OutputResolution
-                  }))
-                }
-              >
-                <option value="720">720p</option>
-                <option value="1080">1080p</option>
-                <option value="1440">1440p</option>
-              </select>
-              <small>Preserves aspect ratio and does not upscale smaller videos.</small>
-            </label>
-
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={options.useTargetLength}
-                onChange={(event) =>
-                  setOptions((current) => ({ ...current, useTargetLength: event.target.checked }))
-                }
-              />
-              <span>Use target video length</span>
-            </label>
-
-            {options.useTargetLength ? (
-              <label className="field target-field">
-                <span>Target length in seconds</span>
-                <input
-                  type="number"
-                  min="0.1"
-                  max={options.outputFormat === "github-gif" ? GITHUB_GIF_MAX_SECONDS : undefined}
-                  step="0.1"
-                  value={options.targetSeconds}
-                  onChange={(event) => {
-                    const maxSeconds = options.outputFormat === "github-gif" ? GITHUB_GIF_MAX_SECONDS : 86400;
-                    setOptions((current) => ({
-                      ...current,
-                      targetSeconds: Math.min(
-                        maxSeconds,
-                        Math.max(0.1, Number(event.target.value) || current.targetSeconds)
-                      )
-                    }));
-                  }}
-                />
-              </label>
-            ) : null}
 
             <label className="toggle">
               <input
@@ -704,35 +843,6 @@ function App() {
               </div>
               <small>{compactPath(options.outputDir)}</small>
             </div>
-          </section>
-
-          <section className="runtime">
-            <div className="panel-title">
-              <Clock3 size={16} />
-              Runtime
-            </div>
-            <p className={runtime?.ffmpegFound && runtime?.ffprobeFound ? "ok" : "warn"}>
-              {runtime?.message ?? "Checking ffmpeg..."}
-            </p>
-            <div className="field runtime-folder">
-              <span>FFmpeg folder</span>
-              <div className="folder-picker-row">
-                <input
-                  value={options.ffmpegDir}
-                  placeholder="Browse to ffmpeg bin folder"
-                  title={options.ffmpegDir || "Browse to ffmpeg bin folder"}
-                  onChange={(event) => setOptions((current) => ({ ...current, ffmpegDir: event.target.value }))}
-                />
-                <button className="secondary mini-button" onClick={chooseFfmpegFolder} title="Choose FFmpeg folder">
-                  <FolderOpen size={14} />
-                </button>
-              </div>
-            </div>
-            <small>BatchLapse checks this folder, app folders, a local bin folder, a common Windows FFmpeg folder, then PATH.</small>
-            <button className="secondary folder-button" onClick={() => void refreshRuntime()}>
-              <RotateCcw size={16} />
-              Refresh runtime
-            </button>
           </section>
         </aside>
 
@@ -792,11 +902,7 @@ function App() {
             <Download size={42} />
             <div>
               <h3>Drop videos or folders here</h3>
-              <p>
-                {options.useTargetLength
-                  ? `Each video is sped up to target ${options.targetSeconds}s exports.`
-                  : `Each video is exported at ${options.multiplier.toFixed(1)}x speed.`}
-              </p>
+              <p>{exportSummary}</p>
             </div>
           </section>
 
@@ -826,7 +932,7 @@ function App() {
                   <div>{item.speed ? `${item.speed.toFixed(2)}x` : projectedSpeed(item)}</div>
                   <div className="status">
                     {statusIcon(item.status)}
-                    <span>{item.message ?? item.status}</span>
+                    <span title={item.message ?? item.status}>{item.message ?? item.status}</span>
                     {item.status === "running" ? (
                       <div className="progress-shell" aria-label="Export progress">
                         <div className="progress-fill" style={{ width: `${Math.round(item.progress ?? 0)}%` }} />
@@ -854,11 +960,41 @@ function App() {
             )}
           </section>
 
-          <section className="log">
-            {log.length === 0 ? <p>Export messages will appear here.</p> : null}
-            {log.map((line, index) => (
-              <p key={`${line}-${index}`}>{line}</p>
-            ))}
+          <section className="diagnostics">
+            <section className="runtime">
+              <div className="panel-title">
+                <Clock3 size={16} />
+                Runtime
+              </div>
+              <p className={runtime?.ffmpegFound && runtime?.ffprobeFound ? "ok" : "warn"}>
+                {runtime?.message ?? "Checking ffmpeg..."}
+              </p>
+              <div className="field runtime-folder">
+                <span>FFmpeg folder</span>
+                <div className="folder-picker-row">
+                  <input
+                    value={options.ffmpegDir}
+                    placeholder="Browse to ffmpeg bin folder"
+                    title={options.ffmpegDir || "Browse to ffmpeg bin folder"}
+                    onChange={(event) => setOptions((current) => ({ ...current, ffmpegDir: event.target.value }))}
+                  />
+                  <button className="secondary mini-button" onClick={chooseFfmpegFolder} title="Choose FFmpeg folder">
+                    <FolderOpen size={14} />
+                  </button>
+                </div>
+              </div>
+              <button className="secondary folder-button" onClick={() => void refreshRuntime()}>
+                <RotateCcw size={16} />
+                Refresh runtime
+              </button>
+            </section>
+
+            <section className="log">
+              {log.length === 0 ? <p>Export messages will appear here.</p> : null}
+              {log.map((line, index) => (
+                <p key={`${line}-${index}`}>{line}</p>
+              ))}
+            </section>
           </section>
         </section>
       </main>

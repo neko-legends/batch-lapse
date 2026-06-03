@@ -68,6 +68,9 @@ button {
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   overflow: hidden;
   border-right: 1px solid var(--line);
   background: #0b0e11;
@@ -137,7 +140,13 @@ small,
 }
 
 .runtime {
-  margin-top: 12px;
+  min-width: 0;
+}
+
+.sidebar .panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
 }
 
 .panel-title {
@@ -258,10 +267,10 @@ select:disabled {
 .workspace {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 12px;
   min-width: 0;
   min-height: 0;
-  padding: 30px;
+  padding: 24px;
 }
 
 .topbar {
@@ -359,7 +368,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 18px;
-  min-height: 170px;
+  min-height: 118px;
   border: 1px dashed var(--line-strong);
   border-radius: 8px;
   color: var(--amber);
@@ -393,7 +402,7 @@ button:disabled {
 .queue-header,
 .queue-row {
   display: grid;
-  grid-template-columns: minmax(240px, 1.35fr) 90px 95px 80px minmax(170px, 0.8fr) minmax(240px, 1fr);
+  grid-template-columns: minmax(160px, 0.8fr) 86px 92px 74px minmax(240px, 1fr) minmax(340px, 1.35fr);
   gap: 16px;
   align-items: center;
   padding: 13px 16px;
@@ -506,11 +515,27 @@ button:disabled {
   color: var(--muted);
 }
 
+.diagnostics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  flex: 0 0 248px;
+  min-height: 0;
+}
+
+.diagnostics .runtime {
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 16px;
+}
+
 .log {
-  flex: 0 0 118px;
   min-height: 0;
   overflow: auto;
   padding: 12px 16px;
+}
+
+.log {
   user-select: text;
 }
 

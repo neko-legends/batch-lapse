@@ -25,15 +25,22 @@ This is a 15-second GitHub GIF export from BatchLapse:
 - Strip audio checkbox, enabled by default.
 - Target length mode disables the multiplier and calculates the speed from each
   source duration.
+- Optional source clip length processes only the first N seconds of each source
+  before applying the speed or target-length setting.
 - Output formats: MP4 (H.264), WebM (VP9), or GIF for GitHub.
-- Output resolution dropdown with 720p by default, plus 1080p and 1440p.
+- Output resolution dropdown with 480p, 720p by default, 1080p, and 1440p.
   BatchLapse preserves horizontal or vertical orientation and does not upscale
   smaller videos.
-- GitHub GIF exports use 15 fps, loop forever, use the selected output
-  resolution, and do not include audio.
-- GitHub limits GIF uploads in issues and pull requests to 10 MB. BatchLapse
-  caps GitHub GIF exports at 30 seconds because that is close to the upload
-  limit with this profile.
+- GitHub GIF exports loop forever, do not include audio, and include a GIF FPS
+  control.
+- Optional target file size in MB, capped at 9.5 MB for GitHub-friendly GIFs.
+  MP4/WebM exports use bitrate targeting. GIF exports retry with lower FPS and
+  resolution when needed. If a full source is still too large, use source clip
+  length to ignore the rest of the video instead of silently dropping content.
+- GitHub limits GIF uploads in issues and pull requests to 10 MB. Without the
+  MB target, BatchLapse caps GitHub GIF exports at 30 seconds. Target length
+  controls duration only; enable the MB target when the output must stay below a
+  specific upload size.
 - Output folder field with same-folder output as the default.
 - Per-file queue status, progress, output path, and open-output-folder button.
 - Existing exports are numbered automatically unless Replace existing exports is enabled.

@@ -20,7 +20,14 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts", "m2ts",
 ];
 const GITHUB_GIF_MAX_SECONDS: f64 = 30.0;
-const OUTPUT_RESOLUTIONS: &[u32] = &[720, 1080, 1440];
+const OUTPUT_RESOLUTIONS: &[u32] = &[480, 720, 1080, 1440];
+const MIN_TARGET_SIZE_MB: f64 = 0.1;
+const MAX_TARGET_SIZE_MB: f64 = 9.5;
+const MIN_VIDEO_BITRATE_KBPS: u32 = 64;
+const MIN_GIF_FPS: u32 = 5;
+const MAX_GIF_FPS: u32 = 30;
+const MIN_GIF_RESOLUTION: u32 = 240;
+const GIF_TARGET_ATTEMPTS: usize = 8;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -52,6 +59,11 @@ struct SpeedOptions {
     multiplier: f64,
     use_target_length: bool,
     target_seconds: f64,
+    use_clip_length: bool,
+    clip_seconds: f64,
+    use_target_size: bool,
+    target_size_mb: f64,
+    gif_fps: u32,
     strip_audio: bool,
     replace_existing: bool,
     output_format: String,
@@ -434,6 +446,14 @@ fn target_label(seconds: f64) -> String {
     label.replace('.', "_")
 }
 
+fn effective_source_duration(source_duration: f64, options: &SpeedOptions) -> f64 {
+    if options.use_clip_length {
+        source_duration.min(options.clip_seconds)
+    } else {
+        source_duration
+    }
+}
+
 fn output_extension(options: &SpeedOptions) -> &'static str {
     match options.output_format.as_str() {
         "webm-vp9" => "webm",
@@ -457,10 +477,15 @@ fn unique_output_path(input: &Path, options: &SpeedOptions, speed: f64) -> Resul
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("video");
-    let suffix = if options.use_target_length {
+    let timing = if options.use_target_length {
         format!("target{}s", target_label(options.target_seconds))
     } else {
         format!("{}x", speed_label(speed))
+    };
+    let suffix = if options.use_clip_length {
+        format!("{timing}_clip{}s", target_label(options.clip_seconds))
+    } else {
+        timing
     };
     let extension = output_extension(options);
     let base = output_dir.join(format!("{stem}_{suffix}.{extension}"));
@@ -486,6 +511,35 @@ fn parse_progress_line(line: &str, output_duration: f64) -> Option<f64> {
         return None;
     }
     Some((micros / 1_000_000.0 / output_duration * 100.0).clamp(0.0, 100.0))
+}
+
+fn target_size_bytes(options: &SpeedOptions) -> Option<u64> {
+    if options.use_target_size {
+        Some((options.target_size_mb * 1_000_000.0).round() as u64)
+    } else {
+        None
+    }
+}
+
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("Unable to read output file size: {error}"))
+}
+
+fn format_mb(bytes: u64) -> String {
+    format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+}
+
+fn emit_worker_log(app: &AppHandle, input: &Path, message: impl Into<String>) {
+    let _ = app.emit(
+        "video-worker-event",
+        serde_json::json!({
+            "type": "log",
+            "path": input.display().to_string(),
+            "message": message.into()
+        }),
+    );
 }
 
 fn resolution_filter(output_resolution: u32) -> String {
@@ -570,58 +624,53 @@ fn run_ffmpeg_command(
     Ok(())
 }
 
-fn run_ffmpeg_export(
+fn audio_bitrate_kbps(strip_audio: bool, has_audio: bool, webm_vp9: bool) -> u32 {
+    if strip_audio || !has_audio {
+        0
+    } else if webm_vp9 {
+        128
+    } else {
+        192
+    }
+}
+
+fn target_video_bitrate_kbps(
+    target_bytes: u64,
+    output_duration: f64,
+    audio_kbps: u32,
+) -> Result<u32, String> {
+    let total_kbps = target_bytes as f64 * 8.0 / output_duration / 1000.0;
+    let video_kbps = (total_kbps * 0.94) - audio_kbps as f64;
+    if video_kbps < MIN_VIDEO_BITRATE_KBPS as f64 {
+        return Err(format!("MB target too small for {:.1}s.", output_duration));
+    }
+    Ok(video_kbps.floor() as u32)
+}
+
+fn run_standard_video_pass(
     app: &AppHandle,
     active_jobs: &ActiveJobState,
     job_id: &str,
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
+    clip_duration: Option<f64>,
     speed: f64,
-    duration: f64,
+    output_duration: f64,
     strip_audio: bool,
-    output_format: &str,
+    has_audio: bool,
     output_resolution: u32,
+    webm_vp9: bool,
+    target_video_kbps: Option<u32>,
 ) -> Result<(), String> {
-    let output_duration = duration / speed;
-    let github_gif = output_format.eq_ignore_ascii_case("github-gif");
-    let webm_vp9 = output_format.eq_ignore_ascii_case("webm-vp9");
-
-    if github_gif {
-        if output_duration > GITHUB_GIF_MAX_SECONDS {
-            return Err(format!(
-                "GitHub GIF exports are capped at {:.0} seconds. Enable target length and use {:.0} seconds or less, or choose MP4/WebM.",
-                GITHUB_GIF_MAX_SECONDS, GITHUB_GIF_MAX_SECONDS
-            ));
-        }
-
-        let mut command = Command::new(ffmpeg);
-        configure_worker_command(&mut command);
-        command
-            .args(["-hide_banner", "-nostdin", "-y", "-i"])
-            .arg(input)
-            .args(["-filter_complex"])
-            .arg(github_gif_filter(speed, output_resolution, 15))
-            .args(["-loop", "0", "-an", "-progress", "pipe:1", "-nostats"])
-            .arg(output)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        return run_ffmpeg_command(
-            app,
-            active_jobs,
-            job_id,
-            command,
-            input,
-            output,
-            output_duration,
-        );
-    }
-
     let mut command = Command::new(ffmpeg);
     configure_worker_command(&mut command);
+    command.args(["-hide_banner", "-nostdin", "-y"]);
+    if let Some(clip_duration) = clip_duration {
+        command.arg("-t").arg(format!("{clip_duration:.6}"));
+    }
     command
-        .args(["-hide_banner", "-nostdin", "-y", "-i"])
+        .arg("-i")
         .arg(input)
         .args(["-map", "0:v:0", "-filter:v"])
         .arg(format!(
@@ -630,12 +679,28 @@ fn run_ffmpeg_export(
         ));
 
     if webm_vp9 {
-        command.args(["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0"]);
+        command.args(["-c:v", "libvpx-vp9"]);
+        if let Some(kbps) = target_video_kbps {
+            command.arg("-b:v").arg(format!("{kbps}k"));
+        } else {
+            command.args(["-crf", "32", "-b:v", "0"]);
+        }
     } else {
-        command.args(["-c:v", "libx264", "-preset", "medium", "-crf", "20"]);
+        command.args(["-c:v", "libx264", "-preset", "medium"]);
+        if let Some(kbps) = target_video_kbps {
+            command
+                .arg("-b:v")
+                .arg(format!("{kbps}k"))
+                .arg("-maxrate")
+                .arg(format!("{kbps}k"))
+                .arg("-bufsize")
+                .arg(format!("{}k", kbps.saturating_mul(2)));
+        } else {
+            command.args(["-crf", "20"]);
+        }
     }
 
-    if strip_audio {
+    if strip_audio || !has_audio {
         command.arg("-an");
     } else {
         let audio_filter = atempo_chain(speed);
@@ -665,6 +730,302 @@ fn run_ffmpeg_export(
         input,
         output,
         output_duration,
+    )
+}
+
+fn run_standard_video_export(
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    job_id: &str,
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    clip_duration: Option<f64>,
+    speed: f64,
+    output_duration: f64,
+    strip_audio: bool,
+    has_audio: bool,
+    output_resolution: u32,
+    webm_vp9: bool,
+    target_bytes: Option<u64>,
+) -> Result<(), String> {
+    let Some(target_bytes) = target_bytes else {
+        return run_standard_video_pass(
+            app,
+            active_jobs,
+            job_id,
+            ffmpeg,
+            input,
+            output,
+            clip_duration,
+            speed,
+            output_duration,
+            strip_audio,
+            has_audio,
+            output_resolution,
+            webm_vp9,
+            None,
+        );
+    };
+
+    let audio_kbps = audio_bitrate_kbps(strip_audio, has_audio, webm_vp9);
+    let mut video_kbps = target_video_bitrate_kbps(target_bytes, output_duration, audio_kbps)?;
+
+    for attempt in 1..=4 {
+        if attempt > 1 {
+            emit_worker_log(
+                app,
+                input,
+                format!(
+                    "Retrying size target at {video_kbps} kbps video bitrate for {}.",
+                    format_mb(target_bytes)
+                ),
+            );
+        }
+        let _ = fs::remove_file(output);
+        run_standard_video_pass(
+            app,
+            active_jobs,
+            job_id,
+            ffmpeg,
+            input,
+            output,
+            clip_duration,
+            speed,
+            output_duration,
+            strip_audio,
+            has_audio,
+            output_resolution,
+            webm_vp9,
+            Some(video_kbps),
+        )?;
+
+        let size = file_size(output)?;
+        if size <= target_bytes {
+            return Ok(());
+        }
+
+        let _ = fs::remove_file(output);
+        let ratio = (target_bytes as f64 / size as f64 * 0.92).clamp(0.2, 0.95);
+        let next_kbps = (video_kbps as f64 * ratio).floor() as u32;
+        video_kbps = if next_kbps >= video_kbps {
+            video_kbps.saturating_sub(32)
+        } else {
+            next_kbps
+        };
+        if video_kbps < MIN_VIDEO_BITRATE_KBPS {
+            break;
+        }
+    }
+
+    Err("Shorten clip; size floor hit.".to_string())
+}
+
+fn run_gif_pass(
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    job_id: &str,
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    clip_duration: Option<f64>,
+    speed: f64,
+    output_duration: f64,
+    output_resolution: u32,
+    fps: u32,
+) -> Result<(), String> {
+    let mut command = Command::new(ffmpeg);
+    configure_worker_command(&mut command);
+    command.args(["-hide_banner", "-nostdin", "-y"]);
+    if let Some(clip_duration) = clip_duration {
+        command.arg("-t").arg(format!("{clip_duration:.6}"));
+    }
+    command
+        .arg("-i")
+        .arg(input)
+        .args(["-filter_complex"])
+        .arg(github_gif_filter(speed, output_resolution, fps))
+        .args(["-loop", "0", "-an", "-progress", "pipe:1", "-nostats"])
+        .arg(output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    run_ffmpeg_command(
+        app,
+        active_jobs,
+        job_id,
+        command,
+        input,
+        output,
+        output_duration,
+    )
+}
+
+fn next_gif_settings(
+    target_bytes: u64,
+    actual_bytes: u64,
+    current_resolution: u32,
+    current_fps: u32,
+) -> Option<(u32, u32)> {
+    let ratio = (target_bytes as f64 / actual_bytes as f64).clamp(0.18, 0.9);
+    let factor = ratio.powf(0.45);
+    let mut next_fps = (current_fps as f64 * factor).floor() as u32;
+    let mut next_resolution = (current_resolution as f64 * factor).floor() as u32;
+
+    next_fps = next_fps.max(MIN_GIF_FPS);
+    next_resolution = (next_resolution / 2 * 2).max(MIN_GIF_RESOLUTION);
+
+    if next_fps >= current_fps && current_fps > MIN_GIF_FPS {
+        next_fps = current_fps - 1;
+    }
+    if next_resolution >= current_resolution && current_resolution > MIN_GIF_RESOLUTION {
+        next_resolution = current_resolution
+            .saturating_sub(80)
+            .max(MIN_GIF_RESOLUTION);
+        next_resolution = next_resolution / 2 * 2;
+    }
+
+    if next_fps == current_fps && next_resolution == current_resolution {
+        None
+    } else {
+        Some((next_resolution, next_fps))
+    }
+}
+
+fn run_gif_export(
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    job_id: &str,
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    clip_duration: Option<f64>,
+    speed: f64,
+    output_duration: f64,
+    output_resolution: u32,
+    initial_fps: u32,
+    target_bytes: Option<u64>,
+) -> Result<(), String> {
+    let Some(target_bytes) = target_bytes else {
+        if output_duration > GITHUB_GIF_MAX_SECONDS {
+            return Err("GIF >30s; use MB target.".to_string());
+        }
+
+        return run_gif_pass(
+            app,
+            active_jobs,
+            job_id,
+            ffmpeg,
+            input,
+            output,
+            clip_duration,
+            speed,
+            output_duration,
+            output_resolution,
+            initial_fps,
+        );
+    };
+
+    let mut gif_resolution = output_resolution;
+    let mut fps = initial_fps;
+
+    for attempt in 1..=GIF_TARGET_ATTEMPTS {
+        if attempt > 1 {
+            emit_worker_log(
+                app,
+                input,
+                format!(
+                    "Retrying GIF size target at {fps} fps and {gif_resolution}p for {}.",
+                    format_mb(target_bytes)
+                ),
+            );
+        }
+        let _ = fs::remove_file(output);
+        run_gif_pass(
+            app,
+            active_jobs,
+            job_id,
+            ffmpeg,
+            input,
+            output,
+            clip_duration,
+            speed,
+            output_duration,
+            gif_resolution,
+            fps,
+        )?;
+
+        let size = file_size(output)?;
+        if size <= target_bytes {
+            return Ok(());
+        }
+
+        let _ = fs::remove_file(output);
+        let Some((next_resolution, next_fps)) =
+            next_gif_settings(target_bytes, size, gif_resolution, fps)
+        else {
+            break;
+        };
+        gif_resolution = next_resolution;
+        fps = next_fps;
+    }
+
+    Err("Shorten clip; size floor hit.".to_string())
+}
+
+fn run_ffmpeg_export(
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    job_id: &str,
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    clip_duration: Option<f64>,
+    speed: f64,
+    duration: f64,
+    strip_audio: bool,
+    has_audio: bool,
+    output_format: &str,
+    output_resolution: u32,
+    gif_fps: u32,
+    target_bytes: Option<u64>,
+) -> Result<(), String> {
+    let output_duration = duration / speed;
+    let github_gif = output_format.eq_ignore_ascii_case("github-gif");
+    let webm_vp9 = output_format.eq_ignore_ascii_case("webm-vp9");
+
+    if github_gif {
+        return run_gif_export(
+            app,
+            active_jobs,
+            job_id,
+            ffmpeg,
+            input,
+            output,
+            clip_duration,
+            speed,
+            output_duration,
+            output_resolution,
+            gif_fps,
+            target_bytes,
+        );
+    }
+
+    run_standard_video_export(
+        app,
+        active_jobs,
+        job_id,
+        ffmpeg,
+        input,
+        output,
+        clip_duration,
+        speed,
+        output_duration,
+        strip_audio,
+        has_audio,
+        output_resolution,
+        webm_vp9,
+        target_bytes,
     )
 }
 
@@ -773,6 +1134,9 @@ fn start_speed_job(
     if options.use_target_length && options.target_seconds <= 0.0 {
         return Err("Target length must be greater than 0 seconds.".to_string());
     }
+    if options.use_clip_length && options.clip_seconds <= 0.0 {
+        return Err("Clip length must be greater than 0 seconds.".to_string());
+    }
     if !options.use_target_length && !(1.0..=10.0).contains(&options.multiplier) {
         return Err("Multiplier must be between 1x and 10x.".to_string());
     }
@@ -780,7 +1144,15 @@ fn start_speed_job(
         return Err("Unsupported output format.".to_string());
     }
     if !OUTPUT_RESOLUTIONS.contains(&options.output_resolution) {
-        return Err("Output resolution must be 720p, 1080p, or 1440p.".to_string());
+        return Err("Output resolution must be 480p, 720p, 1080p, or 1440p.".to_string());
+    }
+    if options.use_target_size
+        && !(MIN_TARGET_SIZE_MB..=MAX_TARGET_SIZE_MB).contains(&options.target_size_mb)
+    {
+        return Err("Target size must be 0.1-9.5 MB.".to_string());
+    }
+    if !(MIN_GIF_FPS..=MAX_GIF_FPS).contains(&options.gif_fps) {
+        return Err("GIF FPS must be 5-30.".to_string());
     }
     let ffmpeg = find_binary(&app, "ffmpeg", &options.ffmpeg_dir)
         .ok_or_else(|| missing_binary_message("ffmpeg", &options.ffmpeg_dir))?;
@@ -816,18 +1188,22 @@ fn start_speed_job(
             let result = (|| {
                 let duration = ffprobe_duration(&ffprobe, &input)?;
                 if duration <= 0.0 {
-                    return Err("Video duration is missing or zero.".to_string());
+                    return Err("Video duration missing.".to_string());
+                }
+                let source_duration = effective_source_duration(duration, &options);
+                if source_duration <= 0.0 {
+                    return Err("Clip duration missing.".to_string());
                 }
                 let speed = if options.use_target_length {
-                    if options.target_seconds >= duration {
-                        return Err(format!(
-                            "Target length must be shorter than the source duration ({duration:.2}s)."
-                        ));
+                    if options.target_seconds >= source_duration {
+                        return Err("Target length >= source.".to_string());
                     }
-                    duration / options.target_seconds
+                    source_duration / options.target_seconds
                 } else {
                     options.multiplier
                 };
+                let clip_duration = options.use_clip_length.then_some(source_duration);
+                let has_audio = ffprobe_has_audio(&ffprobe, &input);
                 let output = unique_output_path(&input, &options, speed)?;
                 run_ffmpeg_export(
                     &app_for_thread,
@@ -836,11 +1212,15 @@ fn start_speed_job(
                     &ffmpeg,
                     &input,
                     &output,
+                    clip_duration,
                     speed,
-                    duration,
+                    source_duration,
                     options.strip_audio,
+                    has_audio,
                     &options.output_format,
                     options.output_resolution,
+                    options.gif_fps,
+                    target_size_bytes(&options),
                 )?;
                 Ok((output, speed))
             })();
