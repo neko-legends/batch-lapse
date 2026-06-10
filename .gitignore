@@ -9,6 +9,7 @@ src-tauri/target/
 
 # Portable/release artifacts
 dist-portable/
+release/
 src-tauri/target/
 *.msi
 *.exe
