@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 type QueueStatus = "pending" | "running" | "done" | "error" | "canceled";
 type OutputFormat = "mp4-h264" | "webm-vp9" | "github-gif";
 type OutputResolution = 480 | 720 | 1080 | 1440;
+type DimensionReduction = 1 | 1.5 | 2 | 2.5 | 3;
 type SpeedMode = "multiplier" | "target-length";
 
 type RuntimeStatus = {
@@ -42,6 +43,11 @@ type VideoInfo = {
   error: string | null;
 };
 
+type PreviewFrame = {
+  seconds: number;
+  dataUrl: string;
+};
+
 type SpeedOptions = {
   multiplier: number;
   speedMode: SpeedMode;
@@ -55,6 +61,7 @@ type SpeedOptions = {
   replaceExisting: boolean;
   outputFormat: OutputFormat;
   outputResolution: OutputResolution;
+  dimensionReduction: DimensionReduction;
   outputDir: string;
   ffmpegDir: string;
   recursive: boolean;
@@ -67,6 +74,10 @@ type QueueItem = {
   width?: number | null;
   height?: number | null;
   hasAudio?: boolean;
+  clipStartSeconds?: number;
+  clipEndSeconds?: number;
+  previewFrames?: PreviewFrame[];
+  previewLoading?: boolean;
   progress?: number;
   output?: string;
   speed?: number;
@@ -89,10 +100,24 @@ type WorkerEvent = {
   message?: string;
 };
 
+type AgentServerStatus = {
+  enabled: boolean;
+  port: number;
+  url: string;
+  openapiUrl: string;
+  busy: boolean;
+  activeJobId: string | null;
+  message: string;
+};
+
 const SETTINGS_STORAGE_KEY = "batchlapse.settings.v1";
+const AGENT_STORAGE_KEY = "batchlapse.agentControlEnabled.v1";
+const AGENT_PORT_STORAGE_KEY = "batchlapse.agentApiPort.v1";
+const DEFAULT_AGENT_API_PORT = 17336;
 const VIDEO_EXTENSIONS = ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpeg", "mpg", "ts", "mts", "m2ts"];
 const OUTPUT_FORMAT_OPTIONS: OutputFormat[] = ["mp4-h264", "webm-vp9", "github-gif"];
 const OUTPUT_RESOLUTION_OPTIONS: OutputResolution[] = [480, 720, 1080, 1440];
+const DIMENSION_REDUCTION_OPTIONS: DimensionReduction[] = [1, 1.5, 2, 2.5, 3];
 const SPEED_MODE_OPTIONS: SpeedMode[] = ["multiplier", "target-length"];
 const GITHUB_GIF_MAX_SECONDS = 30;
 const TARGET_SIZE_MAX_MB = 9.5;
@@ -112,6 +137,7 @@ const defaultOptions: SpeedOptions = {
   replaceExisting: false,
   outputFormat: "mp4-h264",
   outputResolution: 720,
+  dimensionReduction: 1,
   outputDir: "",
   ffmpegDir: "",
   recursive: true
@@ -119,6 +145,11 @@ const defaultOptions: SpeedOptions = {
 
 const isTauriRuntime = () => "__TAURI_INTERNALS__" in window || "__TAURI__" in window;
 const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
+
+function normalizeAgentPort(value: string) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
+}
 
 function coerceNumber(value: unknown, fallback: number, min: number, max: number) {
   return typeof value === "number" && Number.isFinite(value)
@@ -136,6 +167,12 @@ function coerceChoice<T extends string>(value: unknown, choices: T[], fallback: 
 
 function coerceResolution(value: unknown, fallback: OutputResolution) {
   return OUTPUT_RESOLUTION_OPTIONS.includes(value as OutputResolution) ? (value as OutputResolution) : fallback;
+}
+
+function coerceDimensionReduction(value: unknown, fallback: DimensionReduction) {
+  return DIMENSION_REDUCTION_OPTIONS.includes(value as DimensionReduction)
+    ? (value as DimensionReduction)
+    : fallback;
 }
 
 function loadSavedOptions(): SpeedOptions {
@@ -164,6 +201,7 @@ function loadSavedOptions(): SpeedOptions {
       replaceExisting: coerceBoolean(parsed.replaceExisting, defaultOptions.replaceExisting),
       outputFormat,
       outputResolution: coerceResolution(parsed.outputResolution, defaultOptions.outputResolution),
+      dimensionReduction: coerceDimensionReduction(parsed.dimensionReduction, defaultOptions.dimensionReduction),
       outputDir: typeof parsed.outputDir === "string" ? parsed.outputDir : "",
       ffmpegDir: typeof parsed.ffmpegDir === "string" ? parsed.ffmpegDir : defaultOptions.ffmpegDir,
       recursive: coerceBoolean(parsed.recursive, defaultOptions.recursive)
@@ -184,6 +222,12 @@ function formatDuration(seconds?: number | null) {
     return `${hours}:${String(mins).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
   }
   return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function formatSeconds(seconds?: number | null) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "--";
+  if (seconds >= 60) return formatDuration(seconds);
+  return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
 }
 
 function formatResolution(width?: number | null, height?: number | null) {
@@ -215,6 +259,13 @@ function App() {
   const [headline, setHeadline] = useState("Drop videos or folders");
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [agentControlEnabled, setAgentControlEnabled] = useState(
+    () => window.localStorage.getItem(AGENT_STORAGE_KEY) === "1"
+  );
+  const [agentPort, setAgentPort] = useState(
+    () => window.localStorage.getItem(AGENT_PORT_STORAGE_KEY) ?? String(DEFAULT_AGENT_API_PORT)
+  );
+  const [agentStatus, setAgentStatus] = useState<AgentServerStatus | null>(null);
 
   const completeCount = useMemo(() => queue.filter((item) => item.status === "done").length, [queue]);
   const errorCount = useMemo(() => queue.filter((item) => item.status === "error").length, [queue]);
@@ -229,6 +280,68 @@ function App() {
     setLog((current) => [line, ...current].slice(0, 80));
   }, []);
 
+  const refreshAgentStatus = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    const status = await invoke<AgentServerStatus>("get_agent_server_status");
+    setAgentStatus(status);
+    if (status.enabled || !agentControlEnabled) {
+      const nextPort = String(status.port || DEFAULT_AGENT_API_PORT);
+      setAgentPort(nextPort);
+      window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, nextPort);
+    }
+  }, [agentControlEnabled]);
+
+  const toggleAgentControl = useCallback(
+    async (enabled: boolean) => {
+      const port = normalizeAgentPort(agentPort);
+      if (enabled && port === null) {
+        pushLog("Choose an Agent API port between 1 and 65535.");
+        return;
+      }
+      setAgentControlEnabled(enabled);
+      window.localStorage.setItem(AGENT_STORAGE_KEY, enabled ? "1" : "0");
+      if (port !== null) {
+        window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port));
+      }
+      if (!isTauriRuntime()) return;
+      try {
+        const status = await invoke<AgentServerStatus>("set_agent_server_enabled", {
+          enabled,
+          port: port ?? agentStatus?.port ?? DEFAULT_AGENT_API_PORT
+        });
+        setAgentStatus(status);
+        setAgentPort(String(status.port));
+        pushLog(status.message);
+      } catch (error) {
+        setAgentControlEnabled(false);
+        window.localStorage.setItem(AGENT_STORAGE_KEY, "0");
+        pushLog(String(error));
+      }
+    },
+    [agentPort, agentStatus?.port, pushLog]
+  );
+
+  const applyAgentPort = useCallback(async () => {
+    const port = normalizeAgentPort(agentPort);
+    if (port === null) {
+      pushLog("Choose an Agent API port between 1 and 65535.");
+      return;
+    }
+    window.localStorage.setItem(AGENT_PORT_STORAGE_KEY, String(port));
+    if (!isTauriRuntime() || !agentControlEnabled) return;
+    try {
+      const status = await invoke<AgentServerStatus>("set_agent_server_enabled", {
+        enabled: true,
+        port
+      });
+      setAgentStatus(status);
+      setAgentPort(String(status.port));
+      pushLog(`Agent API moved to ${status.url}`);
+    } catch (error) {
+      pushLog(String(error));
+    }
+  }, [agentControlEnabled, agentPort, pushLog]);
+
   useEffect(() => {
     queueRef.current = queue;
   }, [queue]);
@@ -236,6 +349,26 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(options));
   }, [options]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void refreshAgentStatus().catch((error) => pushLog(`Agent API check failed: ${String(error)}`));
+  }, [pushLog, refreshAgentStatus]);
+
+  useEffect(() => {
+    if (!isTauriRuntime() || !agentControlEnabled) return;
+    const port = normalizeAgentPort(agentPort) ?? DEFAULT_AGENT_API_PORT;
+    void invoke<AgentServerStatus>("set_agent_server_enabled", { enabled: true, port })
+      .then((status) => {
+        setAgentStatus(status);
+        setAgentPort(String(status.port));
+      })
+      .catch((error) => {
+        setAgentControlEnabled(false);
+        window.localStorage.setItem(AGENT_STORAGE_KEY, "0");
+        pushLog(`Agent API failed to start: ${String(error)}`);
+      });
+  }, [agentControlEnabled, agentPort, pushLog]);
 
   useEffect(() => {
     const updateScale = () => {
@@ -267,6 +400,33 @@ function App() {
     }
   }, [options.ffmpegDir, pushLog]);
 
+  const loadPreviewFrames = useCallback(
+    async (paths: string[]) => {
+      if (!isTauriRuntime() || paths.length === 0) return;
+      for (const path of paths) {
+        setQueue((current) =>
+          current.map((item) => (item.path === path ? { ...item, previewLoading: true } : item))
+        );
+        try {
+          const frames = await invoke<PreviewFrame[]>("generate_preview_frames", {
+            path,
+            ffmpegDir: options.ffmpegDir
+          });
+          setQueue((current) =>
+            current.map((item) =>
+              item.path === path ? { ...item, previewFrames: frames, previewLoading: false } : item
+            )
+          );
+        } catch {
+          setQueue((current) =>
+            current.map((item) => (item.path === path ? { ...item, previewLoading: false } : item))
+          );
+        }
+      }
+    },
+    [options.ffmpegDir]
+  );
+
   const probeQueuedVideos = useCallback(
     async (paths: string[]) => {
       if (!isTauriRuntime() || paths.length === 0) return;
@@ -283,16 +443,19 @@ function App() {
                   width: info.width,
                   height: info.height,
                   hasAudio: info.hasAudio,
+                  clipStartSeconds: item.clipStartSeconds ?? 0,
+                  clipEndSeconds: item.clipEndSeconds ?? info.durationSeconds ?? undefined,
                   message: info.error ?? item.message
                 }
               : item;
           })
         );
+        void loadPreviewFrames(paths);
       } catch (error) {
         pushLog(`Could not read video metadata: ${String(error)}`);
       }
     },
-    [options.ffmpegDir, pushLog]
+    [loadPreviewFrames, options.ffmpegDir, pushLog]
   );
 
   const resolvePaths = useCallback(
@@ -517,7 +680,11 @@ function App() {
     );
     try {
       await invoke("start_speed_job", {
-        paths: queue.map((item) => item.path),
+        inputs: queue.map((item) => ({
+          path: item.path,
+          startSeconds: item.clipStartSeconds ?? 0,
+          endSeconds: item.clipEndSeconds ?? item.durationSeconds ?? undefined
+        })),
         options: {
           multiplier: options.multiplier,
           useTargetLength: options.speedMode === "target-length",
@@ -531,6 +698,7 @@ function App() {
           replaceExisting: options.replaceExisting,
           outputFormat: options.outputFormat,
           outputResolution: options.outputResolution,
+          dimensionReduction: options.dimensionReduction,
           outputDir: options.outputDir,
           ffmpegDir: options.ffmpegDir
         }
@@ -561,23 +729,124 @@ function App() {
     }
   };
 
+  const clipStart = (item: QueueItem) => item.clipStartSeconds ?? 0;
+
+  const clipEnd = (item: QueueItem) => item.clipEndSeconds ?? item.durationSeconds ?? 0;
+
+  const selectedSourceSeconds = (item: QueueItem) => {
+    const duration = Math.max(0, clipEnd(item) - clipStart(item));
+    return options.useClipLength ? Math.min(duration, options.clipSeconds) : duration;
+  };
+
+  const updateClipRange = (path: string, nextStart: number, nextEnd: number) => {
+    setQueue((current) =>
+      current.map((item) => {
+        if (item.path !== path) return item;
+        const duration = item.durationSeconds ?? 0;
+        if (duration <= 0) return item;
+        const start = Math.max(0, Math.min(duration, nextStart));
+        const end = Math.max(start + 0.1, Math.min(duration, nextEnd));
+        return {
+          ...item,
+          clipStartSeconds: Math.min(start, Math.max(0, end - 0.1)),
+          clipEndSeconds: end
+        };
+      })
+    );
+  };
+
   const projectedSpeed = (item: QueueItem) => {
     if (options.speedMode !== "target-length") return `${options.multiplier.toFixed(1)}x`;
-    const duration = effectiveSourceSeconds(item.durationSeconds);
+    const duration = selectedSourceSeconds(item);
     if (!duration) return "--";
     return `${(duration / options.targetSeconds).toFixed(2)}x`;
   };
 
-  const effectiveSourceSeconds = (duration?: number | null) => {
-    if (!duration || !Number.isFinite(duration)) return duration;
-    return options.useClipLength ? Math.min(duration, options.clipSeconds) : duration;
-  };
-
   const exportSummary = options.useClipLength
-    ? `Using first ${options.clipSeconds}s of each source.`
+    ? `Using each row's selected range, capped at ${options.clipSeconds}s.`
     : options.speedMode === "target-length"
-      ? `Each video is sped up to target ${options.targetSeconds}s exports.`
-      : `Each video is exported at ${options.multiplier.toFixed(1)}x speed.`;
+      ? `Each selected range is sped up to target ${options.targetSeconds}s exports.`
+      : `Each selected range is exported at ${options.multiplier.toFixed(1)}x speed.`;
+
+  const renderClipControls = (item: QueueItem) => {
+    const duration = item.durationSeconds ?? 0;
+    const start = clipStart(item);
+    const end = clipEnd(item);
+    const startPercent = duration > 0 ? (start / duration) * 100 : 0;
+    const endPercent = duration > 0 ? (end / duration) * 100 : 100;
+    const selectedSeconds = selectedSourceSeconds(item);
+
+    return (
+      <div className="clip-cell">
+        <div className="preview-strip" aria-label="Video preview strip">
+          {item.previewFrames?.length ? (
+            item.previewFrames.map((frame) => (
+              <img src={frame.dataUrl} alt="" key={`${item.path}-${frame.seconds}`} />
+            ))
+          ) : (
+            <div className="preview-placeholder">{item.previewLoading ? "Loading preview" : "Preview pending"}</div>
+          )}
+          {duration > 0 ? (
+            <div
+              className="range-highlight"
+              style={{ left: `${startPercent}%`, width: `${Math.max(0, endPercent - startPercent)}%` }}
+            />
+          ) : null}
+        </div>
+
+        <div className="scrubber">
+          <input
+            type="range"
+            min="0"
+            max={duration || 0}
+            step="0.1"
+            value={start}
+            disabled={!duration || busy}
+            aria-label={`${fileName(item.path)} clip start`}
+            onChange={(event) => updateClipRange(item.path, Number(event.target.value), end)}
+          />
+          <input
+            type="range"
+            min="0"
+            max={duration || 0}
+            step="0.1"
+            value={end}
+            disabled={!duration || busy}
+            aria-label={`${fileName(item.path)} clip end`}
+            onChange={(event) => updateClipRange(item.path, start, Number(event.target.value))}
+          />
+        </div>
+
+        <div className="clip-fields">
+          <label>
+            <span>Start</span>
+            <input
+              type="number"
+              min="0"
+              max={duration || undefined}
+              step="0.1"
+              value={Number(start.toFixed(1))}
+              disabled={!duration || busy}
+              onChange={(event) => updateClipRange(item.path, Number(event.target.value), end)}
+            />
+          </label>
+          <label>
+            <span>End</span>
+            <input
+              type="number"
+              min="0.1"
+              max={duration || undefined}
+              step="0.1"
+              value={Number(end.toFixed(1))}
+              disabled={!duration || busy}
+              onChange={(event) => updateClipRange(item.path, start, Number(event.target.value))}
+            />
+          </label>
+          <small>{formatSeconds(selectedSeconds)} selected</small>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="scale-stage">
@@ -642,6 +911,26 @@ function App() {
                 <option value="1440">1440p</option>
               </select>
               <small>Preserves aspect ratio and does not upscale smaller videos.</small>
+            </label>
+
+            <label className="field">
+              <span>Dimension reduction</span>
+              <select
+                value={options.dimensionReduction}
+                onChange={(event) =>
+                  setOptions((current) => ({
+                    ...current,
+                    dimensionReduction: Number(event.target.value) as DimensionReduction
+                  }))
+                }
+              >
+                <option value="1">Original dimensions</option>
+                <option value="1.5">Reduce 1.5×</option>
+                <option value="2">Reduce 2×</option>
+                <option value="2.5">Reduce 2.5×</option>
+                <option value="3">Reduce 3×</option>
+              </select>
+              <small>Divides both output dimensions after applying the resolution limit.</small>
             </label>
 
             <label className="field">
@@ -843,6 +1132,40 @@ function App() {
               </div>
               <small>{compactPath(options.outputDir)}</small>
             </div>
+
+            <div className="agent-api-block">
+              <div className="panel-title agent-title">Agent API</div>
+              <label className="toggle">
+                <input
+                  type="checkbox"
+                  checked={agentControlEnabled}
+                  onChange={(event) => void toggleAgentControl(event.target.checked)}
+                />
+                <span>Enable local API</span>
+              </label>
+              <label className="field agent-port-field">
+                <span>API port</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="65535"
+                  value={agentPort}
+                  onChange={(event) => setAgentPort(event.target.value)}
+                  onBlur={() => void applyAgentPort()}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.currentTarget.blur();
+                    }
+                  }}
+                />
+              </label>
+              {agentStatus?.enabled ? (
+                <div className="agent-status">
+                  <span>{agentStatus.url}</span>
+                  <small>OpenAPI: {agentStatus.openapiUrl}</small>
+                </div>
+              ) : null}
+            </div>
           </section>
         </aside>
 
@@ -911,6 +1234,7 @@ function App() {
               <span>Input</span>
               <span>Duration</span>
               <span>Source res</span>
+              <span>Clip range</span>
               <span>Speed</span>
               <span>Status</span>
               <span>Output</span>
@@ -929,6 +1253,7 @@ function App() {
                   </div>
                   <div>{formatDuration(item.durationSeconds)}</div>
                   <div>{formatResolution(item.width, item.height)}</div>
+                  {renderClipControls(item)}
                   <div>{item.speed ? `${item.speed.toFixed(2)}x` : projectedSpeed(item)}</div>
                   <div className="status">
                     {statusIcon(item.status)}

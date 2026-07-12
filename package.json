@@ -1,7 +1,7 @@
 {
   "name": "batchlapse",
   "private": true,
-  "version": "26.5.18",
+  "version": "26.7.12",
   "license": "MIT",
   "type": "module",
   "scripts": {

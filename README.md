@@ -27,6 +27,8 @@ This is a 15-second GitHub GIF export from BatchLapse:
   source duration.
 - Optional source clip length processes only the first N seconds of each source
   before applying the speed or target-length setting.
+- Per-video start and end controls let each queued file export a specific range.
+- Tiny preview strips help scrub and choose the useful part of each queued video.
 - Output formats: MP4 (H.264), WebM (VP9), or GIF for GitHub.
 - Output resolution dropdown with 480p, 720p by default, 1080p, and 1440p.
   BatchLapse preserves horizontal or vertical orientation and does not upscale

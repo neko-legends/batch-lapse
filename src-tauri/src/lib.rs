@@ -1,11 +1,17 @@
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{BufRead, BufReader, Read},
+    env, fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
@@ -28,6 +34,18 @@ const MIN_GIF_FPS: u32 = 5;
 const MAX_GIF_FPS: u32 = 30;
 const MIN_GIF_RESOLUTION: u32 = 240;
 const GIF_TARGET_ATTEMPTS: usize = 8;
+const DIMENSION_REDUCTION_FACTORS: [f64; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
+const DEFAULT_AGENT_API_PORT: u16 = 17336;
+const AGENT_APP_ID: &str = "batchlapse";
+const AGENT_APP_NAME: &str = "BatchLapse";
+const AGENT_API_BIND_ADDRESS: &str = "127.0.0.1";
+const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
+const DEFAULT_WINDOW_WIDTH: u32 = 1920;
+const DEFAULT_WINDOW_HEIGHT: u32 = 1080;
+const MIN_WINDOW_WIDTH: u32 = 640;
+const MIN_WINDOW_HEIGHT: u32 = 360;
+const LANDSCAPE_WINDOW_WIDTH_RATIO: f64 = 0.5;
+const PORTRAIT_WINDOW_WIDTH_RATIO: f64 = 0.9;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -53,7 +71,22 @@ struct VideoInfo {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewFrame {
+    seconds: f64,
+    data_url: String,
+}
+
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JobInput {
+    path: String,
+    start_seconds: Option<f64>,
+    end_seconds: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SpeedOptions {
     multiplier: f64,
@@ -68,8 +101,53 @@ struct SpeedOptions {
     replace_existing: bool,
     output_format: String,
     output_resolution: u32,
+    dimension_reduction: f64,
     output_dir: String,
     ffmpeg_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSpeedRequest {
+    inputs: Option<Vec<JobInput>>,
+    paths: Option<Vec<String>>,
+    options: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentServerStatus {
+    enabled: bool,
+    port: u16,
+    url: String,
+    openapi_url: String,
+    busy: bool,
+    active_job_id: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentApiRegistryEntry {
+    app_id: String,
+    app_name: String,
+    default_port: u16,
+    bind_address: String,
+    port: u16,
+    enabled: bool,
+    url: String,
+    openapi_url: String,
+    busy: bool,
+    active_job_id: Option<String>,
+    last_seen: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentApiRegistry {
+    updated_at: String,
+    apps: Vec<AgentApiRegistryEntry>,
 }
 
 #[derive(Clone, Default)]
@@ -167,6 +245,55 @@ impl ActiveJobState {
         let canceled = job.cancel_requested;
         *active = None;
         Ok(canceled)
+    }
+
+    fn active_job_id(&self) -> Result<Option<String>, String> {
+        self.inner
+            .lock()
+            .map(|job| job.as_ref().map(|job| job.id.clone()))
+            .map_err(|_| "Unable to lock active job state.".to_string())
+    }
+}
+
+#[derive(Clone, Default)]
+struct AgentServerState {
+    inner: Arc<Mutex<AgentServerControl>>,
+}
+
+#[derive(Default)]
+struct AgentServerControl {
+    enabled: bool,
+    port: u16,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+impl AgentServerControl {
+    fn port(&self) -> u16 {
+        if self.port == 0 {
+            read_registered_agent_api_port().unwrap_or(DEFAULT_AGENT_API_PORT)
+        } else {
+            self.port
+        }
+    }
+}
+
+fn default_speed_options() -> SpeedOptions {
+    SpeedOptions {
+        multiplier: 2.0,
+        use_target_length: false,
+        target_seconds: 10.0,
+        use_clip_length: false,
+        clip_seconds: 60.0,
+        use_target_size: false,
+        target_size_mb: MAX_TARGET_SIZE_MB,
+        gif_fps: 15,
+        strip_audio: true,
+        replace_existing: false,
+        output_format: "mp4-h264".to_string(),
+        output_resolution: 720,
+        dimension_reduction: 1.0,
+        output_dir: String::new(),
+        ffmpeg_dir: String::new(),
     }
 }
 
@@ -407,6 +534,60 @@ fn probe_video_with(ffprobe: &Path, path: &str) -> VideoInfo {
     }
 }
 
+fn preview_timestamps(duration: f64, count: usize) -> Vec<f64> {
+    if duration <= 0.0 || count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![(duration * 0.5).max(0.0)];
+    }
+    (0..count)
+        .map(|index| {
+            let ratio = index as f64 / (count - 1) as f64;
+            (duration * ratio).min((duration - 0.05).max(0.0))
+        })
+        .collect()
+}
+
+fn generate_preview_frame(
+    ffmpeg: &Path,
+    input: &Path,
+    seconds: f64,
+) -> Result<PreviewFrame, String> {
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .arg("-ss")
+        .arg(format!("{seconds:.3}"))
+        .arg("-i")
+        .arg(input)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=w='if(gte(iw\\,ih)\\,160\\,-2)':h='if(gte(iw\\,ih)\\,-2\\,90)':flags=lanczos",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]);
+    hide_command_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("Unable to generate preview frame: {error}"))?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(PreviewFrame {
+        seconds,
+        data_url: format!(
+            "data:image/jpeg;base64,{}",
+            general_purpose::STANDARD.encode(output.stdout)
+        ),
+    })
+}
+
 fn atempo_chain(mut speed: f64) -> String {
     if speed <= 0.0 {
         return "atempo=1.0".to_string();
@@ -446,12 +627,27 @@ fn target_label(seconds: f64) -> String {
     label.replace('.', "_")
 }
 
-fn effective_source_duration(source_duration: f64, options: &SpeedOptions) -> f64 {
+fn normalized_clip_range(
+    input: &JobInput,
+    source_duration: f64,
+    options: &SpeedOptions,
+) -> Result<(f64, f64), String> {
+    let start = input
+        .start_seconds
+        .unwrap_or(0.0)
+        .clamp(0.0, source_duration);
+    let mut duration = input
+        .end_seconds
+        .unwrap_or(source_duration)
+        .clamp(0.0, source_duration)
+        - start;
     if options.use_clip_length {
-        source_duration.min(options.clip_seconds)
-    } else {
-        source_duration
+        duration = duration.min(options.clip_seconds);
     }
+    if duration <= 0.0 {
+        return Err("Clip range must be longer than 0 seconds.".to_string());
+    }
+    Ok((start, duration))
 }
 
 fn output_extension(options: &SpeedOptions) -> &'static str {
@@ -462,7 +658,14 @@ fn output_extension(options: &SpeedOptions) -> &'static str {
     }
 }
 
-fn unique_output_path(input: &Path, options: &SpeedOptions, speed: f64) -> Result<PathBuf, String> {
+fn unique_output_path(
+    input: &Path,
+    options: &SpeedOptions,
+    speed: f64,
+    clip_start: f64,
+    clip_duration: f64,
+    source_duration: f64,
+) -> Result<PathBuf, String> {
     let output_dir = if options.output_dir.trim().is_empty() {
         input
             .parent()
@@ -482,8 +685,15 @@ fn unique_output_path(input: &Path, options: &SpeedOptions, speed: f64) -> Resul
     } else {
         format!("{}x", speed_label(speed))
     };
-    let suffix = if options.use_clip_length {
-        format!("{timing}_clip{}s", target_label(options.clip_seconds))
+    let clip_end = clip_start + clip_duration;
+    let has_custom_range =
+        clip_start > 0.001 || (source_duration - clip_end).abs() > 0.001 || options.use_clip_length;
+    let suffix = if has_custom_range {
+        format!(
+            "{timing}_range{}s-{}s",
+            target_label(clip_start),
+            target_label(clip_end)
+        )
     } else {
         timing
     };
@@ -546,6 +756,11 @@ fn resolution_filter(output_resolution: u32) -> String {
     format!(
         "scale=w='if(gte(iw\\,ih)\\,-2\\,min({output_resolution}\\,iw))':h='if(gte(iw\\,ih)\\,min({output_resolution}\\,ih)\\,-2)':flags=lanczos"
     )
+}
+
+fn reduced_output_resolution(output_resolution: u32, reduction: f64) -> u32 {
+    let reduced = ((output_resolution as f64 / reduction).floor() as u32).max(2);
+    reduced - (reduced % 2)
 }
 
 fn github_gif_filter(speed: f64, output_resolution: u32, fps: u32) -> String {
@@ -654,7 +869,8 @@ fn run_standard_video_pass(
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
-    clip_duration: Option<f64>,
+    clip_start: f64,
+    clip_duration: f64,
     speed: f64,
     output_duration: f64,
     strip_audio: bool,
@@ -666,9 +882,10 @@ fn run_standard_video_pass(
     let mut command = Command::new(ffmpeg);
     configure_worker_command(&mut command);
     command.args(["-hide_banner", "-nostdin", "-y"]);
-    if let Some(clip_duration) = clip_duration {
-        command.arg("-t").arg(format!("{clip_duration:.6}"));
+    if clip_start > 0.0 {
+        command.arg("-ss").arg(format!("{clip_start:.6}"));
     }
+    command.arg("-t").arg(format!("{clip_duration:.6}"));
     command
         .arg("-i")
         .arg(input)
@@ -740,7 +957,8 @@ fn run_standard_video_export(
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
-    clip_duration: Option<f64>,
+    clip_start: f64,
+    clip_duration: f64,
     speed: f64,
     output_duration: f64,
     strip_audio: bool,
@@ -757,6 +975,7 @@ fn run_standard_video_export(
             ffmpeg,
             input,
             output,
+            clip_start,
             clip_duration,
             speed,
             output_duration,
@@ -790,6 +1009,7 @@ fn run_standard_video_export(
             ffmpeg,
             input,
             output,
+            clip_start,
             clip_duration,
             speed,
             output_duration,
@@ -828,7 +1048,8 @@ fn run_gif_pass(
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
-    clip_duration: Option<f64>,
+    clip_start: f64,
+    clip_duration: f64,
     speed: f64,
     output_duration: f64,
     output_resolution: u32,
@@ -837,9 +1058,10 @@ fn run_gif_pass(
     let mut command = Command::new(ffmpeg);
     configure_worker_command(&mut command);
     command.args(["-hide_banner", "-nostdin", "-y"]);
-    if let Some(clip_duration) = clip_duration {
-        command.arg("-t").arg(format!("{clip_duration:.6}"));
+    if clip_start > 0.0 {
+        command.arg("-ss").arg(format!("{clip_start:.6}"));
     }
+    command.arg("-t").arg(format!("{clip_duration:.6}"));
     command
         .arg("-i")
         .arg(input)
@@ -899,7 +1121,8 @@ fn run_gif_export(
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
-    clip_duration: Option<f64>,
+    clip_start: f64,
+    clip_duration: f64,
     speed: f64,
     output_duration: f64,
     output_resolution: u32,
@@ -918,6 +1141,7 @@ fn run_gif_export(
             ffmpeg,
             input,
             output,
+            clip_start,
             clip_duration,
             speed,
             output_duration,
@@ -948,6 +1172,7 @@ fn run_gif_export(
             ffmpeg,
             input,
             output,
+            clip_start,
             clip_duration,
             speed,
             output_duration,
@@ -980,7 +1205,8 @@ fn run_ffmpeg_export(
     ffmpeg: &Path,
     input: &Path,
     output: &Path,
-    clip_duration: Option<f64>,
+    clip_start: f64,
+    clip_duration: f64,
     speed: f64,
     duration: f64,
     strip_audio: bool,
@@ -1002,6 +1228,7 @@ fn run_ffmpeg_export(
             ffmpeg,
             input,
             output,
+            clip_start,
             clip_duration,
             speed,
             output_duration,
@@ -1018,6 +1245,7 @@ fn run_ffmpeg_export(
         ffmpeg,
         input,
         output,
+        clip_start,
         clip_duration,
         speed,
         output_duration,
@@ -1100,6 +1328,28 @@ fn probe_videos(
 }
 
 #[tauri::command]
+fn generate_preview_frames(
+    app: AppHandle,
+    path: String,
+    ffmpeg_dir: String,
+) -> Result<Vec<PreviewFrame>, String> {
+    let ffmpeg = find_binary(&app, "ffmpeg", &ffmpeg_dir)
+        .ok_or_else(|| missing_binary_message("ffmpeg", &ffmpeg_dir))?;
+    let ffprobe = find_binary(&app, "ffprobe", &ffmpeg_dir)
+        .ok_or_else(|| missing_binary_message("ffprobe", &ffmpeg_dir))?;
+    let input = PathBuf::from(path);
+    let duration = ffprobe_duration(&ffprobe, &input)?;
+    let frames = preview_timestamps(duration, 7)
+        .into_iter()
+        .filter_map(|seconds| generate_preview_frame(&ffmpeg, &input, seconds).ok())
+        .collect::<Vec<_>>();
+    if frames.is_empty() {
+        return Err("Could not generate preview frames.".to_string());
+    }
+    Ok(frames)
+}
+
+#[tauri::command]
 fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
     let requested_path = PathBuf::from(path);
     let folder = if requested_path.is_dir() {
@@ -1118,14 +1368,13 @@ fn open_containing_folder(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|error| format!("Unable to open folder: {error}"))
 }
 
-#[tauri::command]
-fn start_speed_job(
+fn start_speed_job_core(
     app: AppHandle,
-    active_jobs: State<'_, ActiveJobState>,
-    paths: Vec<String>,
+    active_jobs: &ActiveJobState,
+    inputs: Vec<JobInput>,
     options: SpeedOptions,
 ) -> Result<String, String> {
-    if paths.is_empty() {
+    if inputs.is_empty() {
         return Err("No input videos were provided.".to_string());
     }
     if active_jobs.is_busy()? {
@@ -1146,6 +1395,9 @@ fn start_speed_job(
     if !OUTPUT_RESOLUTIONS.contains(&options.output_resolution) {
         return Err("Output resolution must be 480p, 720p, 1080p, or 1440p.".to_string());
     }
+    if !DIMENSION_REDUCTION_FACTORS.contains(&options.dimension_reduction) {
+        return Err("Dimension reduction must be 1x, 1.5x, 2x, 2.5x, or 3x.".to_string());
+    }
     if options.use_target_size
         && !(MIN_TARGET_SIZE_MB..=MAX_TARGET_SIZE_MB).contains(&options.target_size_mb)
     {
@@ -1161,20 +1413,21 @@ fn start_speed_job(
     let job_id = Uuid::new_v4().to_string();
     active_jobs.start(job_id.clone())?;
 
-    let active_jobs_for_thread = active_jobs.inner().clone();
+    let active_jobs_for_thread = active_jobs.clone();
     let app_for_thread = app.clone();
     let job_id_for_thread = job_id.clone();
 
     thread::spawn(move || {
-        let total = paths.len();
+        let total = inputs.len();
         let mut saved = 0usize;
         let mut failed = 0usize;
 
-        for (index, path) in paths.into_iter().enumerate() {
+        for (index, input_item) in inputs.into_iter().enumerate() {
             if active_jobs_for_thread.is_canceled(&job_id_for_thread) {
                 break;
             }
 
+            let path = input_item.path.clone();
             let input = PathBuf::from(&path);
             let _ = app_for_thread.emit(
                 "video-worker-event",
@@ -1190,21 +1443,25 @@ fn start_speed_job(
                 if duration <= 0.0 {
                     return Err("Video duration missing.".to_string());
                 }
-                let source_duration = effective_source_duration(duration, &options);
-                if source_duration <= 0.0 {
-                    return Err("Clip duration missing.".to_string());
-                }
+                let (clip_start, clip_duration) =
+                    normalized_clip_range(&input_item, duration, &options)?;
                 let speed = if options.use_target_length {
-                    if options.target_seconds >= source_duration {
+                    if options.target_seconds >= clip_duration {
                         return Err("Target length >= source.".to_string());
                     }
-                    source_duration / options.target_seconds
+                    clip_duration / options.target_seconds
                 } else {
                     options.multiplier
                 };
-                let clip_duration = options.use_clip_length.then_some(source_duration);
                 let has_audio = ffprobe_has_audio(&ffprobe, &input);
-                let output = unique_output_path(&input, &options, speed)?;
+                let output = unique_output_path(
+                    &input,
+                    &options,
+                    speed,
+                    clip_start,
+                    clip_duration,
+                    duration,
+                )?;
                 run_ffmpeg_export(
                     &app_for_thread,
                     &active_jobs_for_thread,
@@ -1212,13 +1469,17 @@ fn start_speed_job(
                     &ffmpeg,
                     &input,
                     &output,
+                    clip_start,
                     clip_duration,
                     speed,
-                    source_duration,
+                    clip_duration,
                     options.strip_audio,
                     has_audio,
                     &options.output_format,
-                    options.output_resolution,
+                    reduced_output_resolution(
+                        options.output_resolution,
+                        options.dimension_reduction,
+                    ),
                     options.gif_fps,
                     target_size_bytes(&options),
                 )?;
@@ -1279,6 +1540,16 @@ fn start_speed_job(
 }
 
 #[tauri::command]
+fn start_speed_job(
+    app: AppHandle,
+    active_jobs: State<'_, ActiveJobState>,
+    inputs: Vec<JobInput>,
+    options: SpeedOptions,
+) -> Result<String, String> {
+    start_speed_job_core(app, active_jobs.inner(), inputs, options)
+}
+
+#[tauri::command]
 fn cancel_active_job(active_jobs: State<'_, ActiveJobState>) -> Result<(), String> {
     let pid = active_jobs.request_cancel()?;
     if let Some(pid) = pid {
@@ -1287,17 +1558,597 @@ fn cancel_active_job(active_jobs: State<'_, ActiveJobState>) -> Result<(), Strin
     Ok(())
 }
 
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn validate_agent_api_port(port: Option<u16>) -> Result<u16, String> {
+    let port = port
+        .or_else(read_registered_agent_api_port)
+        .unwrap_or(DEFAULT_AGENT_API_PORT);
+    if port == 0 {
+        return Err("Agent API port must be between 1 and 65535.".to_string());
+    }
+    Ok(port)
+}
+
+fn agent_api_url(port: u16) -> String {
+    format!("http://{AGENT_API_BIND_ADDRESS}:{port}")
+}
+
+fn timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn shared_neko_legends_dir() -> Option<PathBuf> {
+    let base = if cfg!(target_os = "windows") {
+        env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+    } else if cfg!(target_os = "macos") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Application Support"))
+    } else {
+        env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+    Some(base.join("NekoLegends"))
+}
+
+fn agent_api_registry_path() -> Option<PathBuf> {
+    Some(shared_neko_legends_dir()?.join(AGENT_API_REGISTRY_FILE))
+}
+
+fn read_agent_api_registry() -> AgentApiRegistry {
+    let updated_at = timestamp_string();
+    let Some(path) = agent_api_registry_path() else {
+        return AgentApiRegistry {
+            updated_at,
+            apps: Vec::new(),
+        };
+    };
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(AgentApiRegistry {
+            updated_at,
+            apps: Vec::new(),
+        })
+}
+
+fn read_registered_agent_api_port() -> Option<u16> {
+    read_agent_api_registry()
+        .apps
+        .into_iter()
+        .find(|entry| entry.app_id == AGENT_APP_ID)
+        .map(|entry| entry.port)
+        .filter(|port| *port > 0)
+}
+
+fn publish_agent_api_status(status: &AgentServerStatus) {
+    let Some(path) = agent_api_registry_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut registry = read_agent_api_registry();
+    let updated_at = timestamp_string();
+    let entry = AgentApiRegistryEntry {
+        app_id: AGENT_APP_ID.to_string(),
+        app_name: AGENT_APP_NAME.to_string(),
+        default_port: DEFAULT_AGENT_API_PORT,
+        bind_address: AGENT_API_BIND_ADDRESS.to_string(),
+        port: status.port,
+        enabled: status.enabled,
+        url: status.url.clone(),
+        openapi_url: status.openapi_url.clone(),
+        busy: status.busy,
+        active_job_id: status.active_job_id.clone(),
+        last_seen: Some(updated_at.clone()),
+        note: Some("Local Agent API.".to_string()),
+    };
+    if let Some(existing) = registry
+        .apps
+        .iter_mut()
+        .find(|entry| entry.app_id == AGENT_APP_ID)
+    {
+        *existing = entry;
+    } else {
+        registry.apps.push(entry);
+    }
+    registry.updated_at = updated_at;
+    if let Ok(raw) = serde_json::to_string_pretty(&registry) {
+        let _ = fs::write(path, raw);
+    }
+}
+
+fn agent_status_from(
+    agent_state: &AgentServerState,
+    active_jobs: &ActiveJobState,
+) -> Result<AgentServerStatus, String> {
+    let (enabled, port) = {
+        let control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+        (control.enabled, control.port())
+    };
+    let active_job_id = active_jobs.active_job_id()?;
+    let status = AgentServerStatus {
+        enabled,
+        port,
+        url: agent_api_url(port),
+        openapi_url: format!("{}/openapi.json", agent_api_url(port)),
+        busy: active_job_id.is_some(),
+        active_job_id,
+        message: if enabled {
+            "Agent API is enabled.".to_string()
+        } else {
+            "Agent API is off.".to_string()
+        },
+    };
+    publish_agent_api_status(&status);
+    Ok(status)
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("Unable to set read timeout: {error}"))?;
+    let mut data = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let mut expected_len: Option<usize> = None;
+
+    loop {
+        let bytes_read = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("Unable to read agent request: {error}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        data.extend_from_slice(&buffer[..bytes_read]);
+        if let Some(header_end) = find_header_end(&data) {
+            if expected_len.is_none() {
+                let headers = String::from_utf8_lossy(&data[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("content-length") {
+                            value.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                expected_len = Some(header_end + 4 + content_length);
+            }
+            if expected_len.is_some_and(|len| data.len() >= len) {
+                break;
+            }
+        }
+        if data.len() > 2 * 1024 * 1024 {
+            return Err("Agent request is too large.".to_string());
+        }
+    }
+
+    let header_end = find_header_end(&data).ok_or_else(|| "Invalid HTTP request.".to_string())?;
+    let headers = String::from_utf8_lossy(&data[..header_end]);
+    let mut lines = headers.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "Invalid HTTP request line.".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let raw_path = parts.next().unwrap_or("/").to_string();
+    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let body_start = header_end + 4;
+    let body = if body_start <= data.len() {
+        data[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(HttpRequest { method, path, body })
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: &str,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(&payload)
+        .map_err(|error| format!("Unable to serialize agent response: {error}"))?;
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn write_empty_response(stream: &mut TcpStream, status: &str) -> Result<(), String> {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .map_err(|error| format!("Unable to write agent response: {error}"))
+}
+
+fn agent_openapi(port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "BatchLapse Agent API",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [{ "url": agent_api_url(port) }],
+        "paths": {
+            "/health": { "get": { "summary": "Check API status" } },
+            "/status": { "get": { "summary": "Check active export status" } },
+            "/runtime": { "get": { "summary": "Check FFmpeg readiness with default settings" } },
+            "/export": { "post": { "summary": "Start a batch speed export" } },
+            "/generate": { "post": { "summary": "Alias for /export" } },
+            "/cancel": { "post": { "summary": "Cancel the active export" } }
+        }
+    })
+}
+
+fn parse_agent_speed_request(body: &[u8]) -> Result<AgentSpeedRequest, String> {
+    if body.is_empty() {
+        return Ok(AgentSpeedRequest {
+            inputs: None,
+            paths: None,
+            options: None,
+        });
+    }
+    serde_json::from_slice(body).map_err(|error| format!("Invalid JSON request: {error}"))
+}
+
+fn agent_options_from_request(options: Option<serde_json::Value>) -> Result<SpeedOptions, String> {
+    let mut merged = serde_json::to_value(default_speed_options())
+        .map_err(|error| format!("Unable to build default options: {error}"))?;
+    let Some(options) = options else {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    };
+    if options.is_null() {
+        return serde_json::from_value(merged)
+            .map_err(|error| format!("Unable to read default options: {error}"));
+    }
+    let overrides = options
+        .as_object()
+        .ok_or_else(|| "Agent options must be a JSON object.".to_string())?;
+    let base = merged
+        .as_object_mut()
+        .ok_or_else(|| "Unable to merge default options.".to_string())?;
+    for (key, value) in overrides {
+        base.insert(key.clone(), value.clone());
+    }
+    serde_json::from_value(merged).map_err(|error| format!("Invalid agent options: {error}"))
+}
+
+fn agent_inputs_from_request(
+    inputs: Option<Vec<JobInput>>,
+    paths: Option<Vec<String>>,
+    recursive: bool,
+) -> Vec<JobInput> {
+    if let Some(inputs) = inputs {
+        return inputs;
+    }
+    resolve_inputs(paths.unwrap_or_default(), recursive)
+        .into_iter()
+        .map(|path| JobInput {
+            path,
+            start_seconds: None,
+            end_seconds: None,
+        })
+        .collect()
+}
+
+fn handle_agent_route(
+    request: HttpRequest,
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) -> Result<serde_json::Value, String> {
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => Ok(serde_json::json!({
+            "ok": true,
+            "service": "BatchLapse",
+            "version": env!("CARGO_PKG_VERSION"),
+            "url": agent_status_from(agent_state, active_jobs)?.url
+        })),
+        ("GET", "/openapi.json") => Ok(agent_openapi(
+            agent_status_from(agent_state, active_jobs)?.port,
+        )),
+        ("GET", "/status") => serde_json::to_value(agent_status_from(agent_state, active_jobs)?)
+            .map_err(|error| error.to_string()),
+        ("GET", "/runtime") => serde_json::to_value(check_runtime(app.clone(), String::new()))
+            .map_err(|error| error.to_string()),
+        ("POST", "/export") | ("POST", "/generate") => {
+            let request = parse_agent_speed_request(&request.body)?;
+            let AgentSpeedRequest {
+                inputs,
+                paths,
+                options,
+            } = request;
+            let options = agent_options_from_request(options)?;
+            let inputs = agent_inputs_from_request(inputs, paths, true);
+            let job_id = start_speed_job_core(app.clone(), active_jobs, inputs, options)?;
+            Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
+        }
+        ("POST", "/cancel") => {
+            let pid = active_jobs.request_cancel()?;
+            if let Some(pid) = pid {
+                kill_process_tree(pid)?;
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        }
+        _ => Err(format!(
+            "No agent endpoint for {} {}",
+            request.method, request.path
+        )),
+    }
+}
+
+fn handle_agent_stream(
+    mut stream: TcpStream,
+    app: &AppHandle,
+    active_jobs: &ActiveJobState,
+    agent_state: &AgentServerState,
+) {
+    let result = read_http_request(&mut stream).and_then(|request| {
+        if request.method == "OPTIONS" {
+            return write_empty_response(&mut stream, "204 No Content");
+        }
+        match handle_agent_route(request, app, active_jobs, agent_state) {
+            Ok(payload) => write_json_response(&mut stream, "200 OK", payload),
+            Err(error) => write_json_response(
+                &mut stream,
+                "400 Bad Request",
+                serde_json::json!({ "ok": false, "error": error }),
+            ),
+        }
+    });
+    if let Err(error) = result {
+        let _ = write_json_response(
+            &mut stream,
+            "400 Bad Request",
+            serde_json::json!({ "ok": false, "error": error }),
+        );
+    }
+}
+
+fn run_agent_server(
+    listener: TcpListener,
+    app: AppHandle,
+    active_jobs: ActiveJobState,
+    agent_state: AgentServerState,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = listener.set_nonblocking(true);
+    while !stop.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => handle_agent_stream(stream, &app, &active_jobs, &agent_state),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(80));
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_agent_server_status(
+    agent_state: State<'_, AgentServerState>,
+    active_jobs: State<'_, ActiveJobState>,
+) -> Result<AgentServerStatus, String> {
+    agent_status_from(agent_state.inner(), active_jobs.inner())
+}
+
+fn set_agent_server_enabled_inner(
+    app: AppHandle,
+    agent_state: &AgentServerState,
+    active_jobs: &ActiveJobState,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    let port = validate_agent_api_port(port)?;
+    {
+        let mut control = agent_state
+            .inner
+            .lock()
+            .map_err(|_| "Unable to lock agent server state.".to_string())?;
+
+        if control.enabled && (!enabled || control.port() != port) {
+            if let Some(stop) = control.stop.take() {
+                stop.store(true, Ordering::SeqCst);
+            }
+            control.enabled = false;
+        }
+        control.port = port;
+
+        if enabled && !control.enabled {
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .map_err(|error| format!("Unable to start Agent API: {error}"))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            thread::spawn({
+                let app = app.clone();
+                let active_jobs = active_jobs.clone();
+                let agent_state = agent_state.clone();
+                let stop = stop.clone();
+                move || run_agent_server(listener, app, active_jobs, agent_state, stop)
+            });
+            control.enabled = true;
+            control.stop = Some(stop);
+        }
+    }
+
+    agent_status_from(agent_state, active_jobs)
+}
+
+#[tauri::command]
+fn set_agent_server_enabled(
+    app: AppHandle,
+    agent_state: State<'_, AgentServerState>,
+    active_jobs: State<'_, ActiveJobState>,
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<AgentServerStatus, String> {
+    set_agent_server_enabled_inner(app, agent_state.inner(), active_jobs.inner(), enabled, port)
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn agent_api_headless_requested() -> bool {
+    env::args().any(|arg| arg == "--headless" || arg == "--serve-agent-api")
+        || env_truthy("NEKO_AGENT_HEADLESS")
+        || env_truthy("BATCHLAPSE_HEADLESS")
+}
+
+fn agent_api_cli_port() -> Option<u16> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--agent-api-port" || arg == "--agent-port" {
+            return args.next().and_then(|value| value.parse::<u16>().ok());
+        }
+        if let Some(value) = arg
+            .strip_prefix("--agent-api-port=")
+            .or_else(|| arg.strip_prefix("--agent-port="))
+        {
+            return value.parse::<u16>().ok();
+        }
+    }
+    env::var("BATCHLAPSE_AGENT_API_PORT")
+        .or_else(|_| env::var("NEKO_AGENT_API_PORT"))
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+}
+
+fn hide_main_window(app: &tauri::App) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
+    let max = monitor_max.max(1);
+    value.max(min.min(max)).min(max)
+}
+
+fn initial_window_size(monitor_width: u32, monitor_height: u32) -> tauri::PhysicalSize<u32> {
+    let width_ratio = if monitor_width < monitor_height {
+        PORTRAIT_WINDOW_WIDTH_RATIO
+    } else {
+        LANDSCAPE_WINDOW_WIDTH_RATIO
+    };
+    let aspect = DEFAULT_WINDOW_HEIGHT as f64 / DEFAULT_WINDOW_WIDTH as f64;
+    let mut width = (monitor_width as f64 * width_ratio).round();
+    let mut height = (width * aspect).round();
+    let max_height = (monitor_height as f64 * 0.9).round().max(1.0);
+
+    if height > max_height {
+        height = max_height;
+        width = (height / aspect).round();
+    }
+
+    tauri::PhysicalSize::new(width.max(1.0) as u32, height.max(1.0) as u32)
+}
+
+fn apply_initial_window_size(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let monitor_size = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| *monitor.size());
+    let monitor_width = monitor_size
+        .as_ref()
+        .map(|size| size.width)
+        .unwrap_or(DEFAULT_WINDOW_WIDTH);
+    let monitor_height = monitor_size
+        .as_ref()
+        .map(|size| size.height)
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT);
+    let size = initial_window_size(monitor_width, monitor_height);
+    let size = tauri::PhysicalSize::new(
+        clamp_window_dimension(size.width, MIN_WINDOW_WIDTH, monitor_width),
+        clamp_window_dimension(size.height, MIN_WINDOW_HEIGHT, monitor_height),
+    );
+
+    if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
+        eprintln!("Failed to initialize window size: {error}");
+    }
+    let _ = window.center();
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(ActiveJobState::default())
+        .manage(AgentServerState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let headless = agent_api_headless_requested();
+            if !headless {
+                apply_initial_window_size(app);
+            }
+            if headless {
+                hide_main_window(app);
+                let handle = app.handle().clone();
+                let agent_state = app.state::<AgentServerState>().inner().clone();
+                let active_jobs = app.state::<ActiveJobState>().inner().clone();
+                if let Err(error) = set_agent_server_enabled_inner(
+                    handle,
+                    &agent_state,
+                    &active_jobs,
+                    true,
+                    agent_api_cli_port(),
+                ) {
+                    eprintln!("Unable to start Agent API: {error}");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             cancel_active_job,
             check_runtime,
+            generate_preview_frames,
+            get_agent_server_status,
             open_containing_folder,
             probe_videos,
             resolve_inputs,
+            set_agent_server_enabled,
             start_speed_job
         ])
         .run(tauri::generate_context!())
