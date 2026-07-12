@@ -758,9 +758,28 @@ fn resolution_filter(output_resolution: u32) -> String {
     )
 }
 
-fn reduced_output_resolution(output_resolution: u32, reduction: f64) -> u32 {
-    let reduced = ((output_resolution as f64 / reduction).floor() as u32).max(2);
+fn reduced_output_resolution(
+    output_resolution: u32,
+    source_width: u32,
+    source_height: u32,
+    reduction: f64,
+) -> u32 {
+    let capped_source_edge = output_resolution.min(source_width.min(source_height));
+    let reduced = ((capped_source_edge as f64 / reduction).floor() as u32).max(2);
     reduced - (reduced % 2)
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::reduced_output_resolution;
+
+    #[test]
+    fn reduction_uses_the_capped_short_edge_for_every_orientation() {
+        assert_eq!(reduced_output_resolution(720, 1920, 1080, 2.0), 360);
+        assert_eq!(reduced_output_resolution(720, 1080, 1920, 2.0), 360);
+        assert_eq!(reduced_output_resolution(720, 1080, 1080, 2.0), 360);
+        assert_eq!(reduced_output_resolution(720, 640, 360, 2.0), 180);
+    }
 }
 
 fn github_gif_filter(speed: f64, output_resolution: u32, fps: u32) -> String {
@@ -1095,15 +1114,16 @@ fn next_gif_settings(
     let mut next_resolution = (current_resolution as f64 * factor).floor() as u32;
 
     next_fps = next_fps.max(MIN_GIF_FPS);
-    next_resolution = (next_resolution / 2 * 2).max(MIN_GIF_RESOLUTION);
+    let minimum_resolution = MIN_GIF_RESOLUTION.min(current_resolution);
+    next_resolution = (next_resolution / 2 * 2).max(minimum_resolution);
 
     if next_fps >= current_fps && current_fps > MIN_GIF_FPS {
         next_fps = current_fps - 1;
     }
-    if next_resolution >= current_resolution && current_resolution > MIN_GIF_RESOLUTION {
+    if next_resolution >= current_resolution && current_resolution > minimum_resolution {
         next_resolution = current_resolution
             .saturating_sub(80)
-            .max(MIN_GIF_RESOLUTION);
+            .max(minimum_resolution);
         next_resolution = next_resolution / 2 * 2;
     }
 
@@ -1443,6 +1463,8 @@ fn start_speed_job_core(
                 if duration <= 0.0 {
                     return Err("Video duration missing.".to_string());
                 }
+                let (source_width, source_height) = ffprobe_resolution(&ffprobe, &input)
+                    .ok_or_else(|| "Video dimensions missing.".to_string())?;
                 let (clip_start, clip_duration) =
                     normalized_clip_range(&input_item, duration, &options)?;
                 let speed = if options.use_target_length {
@@ -1478,6 +1500,8 @@ fn start_speed_job_core(
                     &options.output_format,
                     reduced_output_resolution(
                         options.output_resolution,
+                        source_width,
+                        source_height,
                         options.dimension_reduction,
                     ),
                     options.gif_fps,

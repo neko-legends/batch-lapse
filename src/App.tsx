@@ -260,7 +260,7 @@ function App() {
   const [log, setLog] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
   const [agentControlEnabled, setAgentControlEnabled] = useState(
-    () => window.localStorage.getItem(AGENT_STORAGE_KEY) === "1"
+    () => window.localStorage.getItem(AGENT_STORAGE_KEY) !== "0"
   );
   const [agentPort, setAgentPort] = useState(
     () => window.localStorage.getItem(AGENT_PORT_STORAGE_KEY) ?? String(DEFAULT_AGENT_API_PORT)
@@ -895,7 +895,7 @@ function App() {
             ) : null}
 
             <label className="field">
-              <span>Output resolution</span>
+              <span>Resolution cap (short edge)</span>
               <select
                 value={options.outputResolution}
                 onChange={(event) =>
@@ -910,7 +910,7 @@ function App() {
                 <option value="1080">1080p</option>
                 <option value="1440">1440p</option>
               </select>
-              <small>Preserves aspect ratio and does not upscale smaller videos.</small>
+              <small>Caps height for landscape, width for portrait, and either edge for square video.</small>
             </label>
 
             <label className="field">
@@ -930,7 +930,7 @@ function App() {
                 <option value="2.5">Reduce 2.5×</option>
                 <option value="3">Reduce 3×</option>
               </select>
-              <small>Divides both output dimensions after applying the resolution limit.</small>
+              <small>Divides the capped dimensions while preserving the source aspect ratio.</small>
             </label>
 
             <label className="field">
