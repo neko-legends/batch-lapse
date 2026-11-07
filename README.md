@@ -54,7 +54,8 @@ available on the machine. On Windows these files are named `ffmpeg.exe` and
 `ffprobe.exe`.
 
 On Windows, the portable build includes these files when they are available in
-the project `bin` folder or in `D:\Tools\ffmpeg\bin`. On macOS and Linux, install
+the project `bin` folder, the folder in the `FFMPEG_DIR` environment variable,
+or on PATH. On macOS and Linux, install
 FFmpeg with your system package manager or place the binaries in the app `bin`
 folder. If BatchLapse cannot find FFmpeg, use the folder button in the Runtime
 panel and choose the folder that contains both files.

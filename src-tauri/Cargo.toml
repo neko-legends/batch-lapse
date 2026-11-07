@@ -1,6 +1,6 @@
 [package]
 name = "batchlapse"
-version = "26.11.8"
+version = "26.11.9"
 description = "Portable batch timelapse video tool"
 authors = ["BatchLapse contributors"]
 license = "MIT"

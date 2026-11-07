@@ -16,12 +16,19 @@ Copy-Item -Force -LiteralPath (Join-Path $root "README.md") -Destination (Join-P
 $ffmpeg = Join-Path $root "bin\ffmpeg.exe"
 $ffprobe = Join-Path $root "bin\ffprobe.exe"
 if (-not ((Test-Path -LiteralPath $ffmpeg) -and (Test-Path -LiteralPath $ffprobe))) {
-  $defaultFfmpegDir = "D:\Tools\ffmpeg\bin"
-  $defaultFfmpeg = Join-Path $defaultFfmpegDir "ffmpeg.exe"
-  $defaultFfprobe = Join-Path $defaultFfmpegDir "ffprobe.exe"
-  if ((Test-Path -LiteralPath $defaultFfmpeg) -and (Test-Path -LiteralPath $defaultFfprobe)) {
-    $ffmpeg = $defaultFfmpeg
-    $ffprobe = $defaultFfprobe
+  # Otherwise use FFMPEG_DIR if set, else the ffmpeg on PATH.
+  $ffmpegDir = $env:FFMPEG_DIR
+  if (-not $ffmpegDir) {
+    $onPath = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($onPath) { $ffmpegDir = Split-Path -Parent $onPath.Source }
+  }
+  if ($ffmpegDir) {
+    $candidateFfmpeg = Join-Path $ffmpegDir "ffmpeg.exe"
+    $candidateFfprobe = Join-Path $ffmpegDir "ffprobe.exe"
+    if ((Test-Path -LiteralPath $candidateFfmpeg) -and (Test-Path -LiteralPath $candidateFfprobe)) {
+      $ffmpeg = $candidateFfmpeg
+      $ffprobe = $candidateFfprobe
+    }
   }
 }
 if ((Test-Path -LiteralPath $ffmpeg) -and (Test-Path -LiteralPath $ffprobe)) {
