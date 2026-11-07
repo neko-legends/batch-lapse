@@ -94,9 +94,13 @@ sudo pacman -S ffmpeg
 
 ## Platform Support
 
-The published release assets are currently Windows builds. The app code is set
-up to run from source on Windows, macOS, and Linux as long as the Tauri desktop
-prerequisites and FFmpeg are installed.
+Releases ship Windows builds (portable exe and installer) and a Linux AppImage.
+macOS users can build from source, as long as the Tauri desktop prerequisites
+and FFmpeg are installed.
+
+### Linux / Omarchy
+
+Each GitHub release includes a Linux AppImage (`BatchLapse_<version>_amd64.AppImage`) next to the Windows builds. Make it executable (`chmod +x`) and run it, or let [Neko Legends Control Center](https://github.com/neko-legends/neko-legends-control-center) install, update and launch it for you. Tested on Omarchy (Arch Linux + Hyprland, Wayland, NVIDIA). Install FFmpeg with your package manager (`sudo pacman -S ffmpeg` on Arch/Omarchy); BatchLapse finds it on `PATH`, or you can pick the folder in the app.
 
 Use the official Tauri prerequisites page for current OS-specific system
 packages:
