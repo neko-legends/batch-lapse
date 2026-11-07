@@ -1,5 +1,6 @@
 :root {
   --ui-scale: 1;
+  color-scheme: dark;
   --bg: #090b0d;
   --panel: #111418;
   --panel-soft: #15191e;
