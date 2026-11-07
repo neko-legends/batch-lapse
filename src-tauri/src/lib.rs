@@ -297,6 +297,7 @@ fn default_speed_options() -> SpeedOptions {
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
 fn hide_command_window(command: &mut Command) {
     #[cfg(target_os = "windows")]
     {
